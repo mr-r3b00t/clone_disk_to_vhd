@@ -137,13 +137,12 @@ function Test-DestinationSpace {
     if ($driveLetter) {
         $destVolume = Get-Volume -DriveLetter $driveLetter -ErrorAction SilentlyContinue
         if ($destVolume) {
-            # Add 10% buffer for safety
-            $requiredWithBuffer = [uint64]($RequiredBytes * 1.1)
-            if ($destVolume.SizeRemaining -lt $requiredWithBuffer) {
+            if ($destVolume.SizeRemaining -lt $RequiredBytes) {
                 $available = Format-ByteSize $destVolume.SizeRemaining
-                $required = Format-ByteSize $requiredWithBuffer
+                $required = Format-ByteSize $RequiredBytes
                 throw "Insufficient space on ${driveLetter}: drive. Required: $required, Available: $available"
             }
+            Write-Host ("  Destination space: " + (Format-ByteSize $destVolume.SizeRemaining) + " available, ~" + (Format-ByteSize $RequiredBytes) + " needed") -ForegroundColor DarkGray
             return $true
         }
     }
@@ -1156,14 +1155,26 @@ function New-BootableVolumeClone {
         $sourceSectorSize = Get-VolumeSectorSize $letter
         Write-Host ("  Source sector size: " + $sourceSectorSize + " bytes") -ForegroundColor DarkGray
         
-        # Calculate VHDX size
+        # Calculate VHDX size (virtual size is always based on full partition)
         $bootSize = 300MB
         if ($BootMode -ne 'UEFI') { $bootSize = 550MB }
         $vhdxSize = [uint64]($partition.Size + $bootSize + 100MB)
         $vhdxSize = [uint64]([math]::Ceiling($vhdxSize / 1MB) * 1MB)
         
+        # Calculate actual space needed on destination
+        # For dynamic VHDX with smart copy: only used space + boot + overhead
+        # For fixed VHDX or full copy: full VHDX size
+        $usedSpace = $volume.Size - $volume.SizeRemaining
+        if ($FixedSizeVHDX -or $FullCopy) {
+            $requiredDestSpace = $vhdxSize
+        }
+        else {
+            # Dynamic VHDX with smart copy - need used space + boot partitions + VHDX metadata overhead (~5%)
+            $requiredDestSpace = [uint64](($usedSpace + $bootSize + 100MB) * 1.05)
+        }
+        
         # Verify destination space
-        Test-DestinationSpace $DestinationVHDX $vhdxSize
+        Test-DestinationSpace $DestinationVHDX $requiredDestSpace
         
         Write-Host ""
         Write-Host ("=" * 60) -ForegroundColor Yellow
@@ -1172,7 +1183,9 @@ function New-BootableVolumeClone {
         Write-Host ""
         Write-Host ("  Source:      " + $letter + ": (" + $volume.FileSystemLabel + ")") -ForegroundColor White
         Write-Host ("  Destination: " + $DestinationVHDX) -ForegroundColor White
-        Write-Host ("  Size:        " + (Format-ByteSize $partition.Size) + " -> " + (Format-ByteSize $vhdxSize) + " VHDX") -ForegroundColor White
+        Write-Host ("  Used Space:  " + (Format-ByteSize $usedSpace)) -ForegroundColor White
+        Write-Host ("  VHDX Size:   " + (Format-ByteSize $vhdxSize) + " (virtual)") -ForegroundColor White
+        Write-Host ("  Disk Needed: ~" + (Format-ByteSize $requiredDestSpace)) -ForegroundColor White
         Write-Host ("  Boot Mode:   " + $BootMode) -ForegroundColor White
         $copyModeText = "Smart (allocated blocks only)"
         if ($FullCopy) { $copyModeText = "Full (entire volume)" }
@@ -1362,7 +1375,7 @@ function Start-InteractiveMode {
             if (-not $label) { $label = "Local Disk" }
             $fs = $v.FileSystemType
             if (-not $fs) { $fs = "Unknown" }
-            Write-Host ("    [" + $num + "] " + $v.DriveLetter + ": " + $label + " - " + $used + "/" + $total + " GB (" + $fs + ")") -ForegroundColor Yellow
+            Write-Host ("    [" + $num + "] " + $v.DriveLetter + ": " + $label + " - " + $used + " GB used / " + $total + " GB total (" + $fs + ")") -ForegroundColor Yellow
         }
         Write-Host "    [0] Exit" -ForegroundColor Red
         Write-Host ""
@@ -1388,8 +1401,12 @@ function Start-InteractiveMode {
         $dateStr = Get-Date -Format 'yyyyMMdd_HHmmss'
         $defaultDest = $srcLetter + ":\VMs\Bootable_" + $srcLetter + "_" + $dateStr + ".vhdx"
         
+        # Calculate required space based on used data (for smart copy with dynamic VHDX)
+        # Used space + boot partition (~550MB) + overhead
+        $usedSpace = $srcVol.Size - $srcVol.SizeRemaining
+        $requiredSpace = [uint64](($usedSpace + 600MB) * 1.1)  # 110% of used space + boot
+        
         # Find other drives with sufficient space
-        $requiredSpace = [uint64]($srcVol.Size * 1.1)  # 110% of source size
         $otherDrives = [System.Collections.ArrayList]::new()
         foreach ($v in $allVolumes) {
             if ($v.DriveLetter -and ([string]$v.DriveLetter) -ne $srcLetter -and $v.DriveType -eq 'Fixed' -and $v.SizeRemaining -gt $requiredSpace) {
@@ -1416,7 +1433,9 @@ function Start-InteractiveMode {
             
             $label = $srcVol.FileSystemLabel
             if (-not $label) { $label = "Local Disk" }
-            Write-Host ("  Source: " + $srcLetter + ": (" + $label + ")") -ForegroundColor White
+            $usedGB = [math]::Round(($srcVol.Size - $srcVol.SizeRemaining) / 1GB, 2)
+            $totalGB = [math]::Round($srcVol.Size / 1GB, 2)
+            Write-Host ("  Source: " + $srcLetter + ": (" + $label + ") - " + $usedGB + " GB used / " + $totalGB + " GB total") -ForegroundColor White
             Write-Host ("  Destination: " + $destPath) -ForegroundColor White
             Write-Host ""
             Write-Host "  Options:" -ForegroundColor White
@@ -1477,6 +1496,11 @@ function Start-InteractiveMode {
                     Write-Host ("    Source:     " + $srcLetter + ":") -ForegroundColor White
                     Write-Host ("    Target:     " + $destPath) -ForegroundColor White
                     Write-Host ("    Boot Mode:  " + $bootMode) -ForegroundColor White
+                    $estSize = [math]::Round((($srcVol.Size - $srcVol.SizeRemaining) + 600MB) / 1GB, 2)
+                    if ($fixedVhdx -or $fullCopy) {
+                        $estSize = [math]::Round(($srcVol.Size + 600MB) / 1GB, 2)
+                    }
+                    Write-Host ("    Est. Size:  ~" + $estSize + " GB") -ForegroundColor White
                     Write-Host ""
                     Write-Host "  Start clone? (Y/n): " -ForegroundColor Green -NoNewline
                     $confirm = (Read-Host).Trim().ToLower()
