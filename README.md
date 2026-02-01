@@ -54,7 +54,7 @@ Download the script directly:
 
 ```powershell
 # Download to current directory
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/mr-r3b00t/clone_disk_to_vhd/Clone.ps1" -OutFile "BootableVolumeClone.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/mr-r3b00t/clone_disk_to_vhd/main/Clone.ps1" -OutFile "Clone.ps1"
 ```
 
 Or clone the repository:
@@ -78,16 +78,16 @@ Simply run the script without parameters for a menu-driven experience:
 ### Command Line Mode
 
 ```powershell
-.\Clone.ps1 -SourceVolume C -DestinationVHDX D:\Backup\MyClone.vhdx
+.\Clone.ps1 -SourceVolume "C" -DestinationVHDX "D:\Backup\MyClone.vhdx"
 ```
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `-SourceVolume` | String | — | Drive letter to clone (e.g., `C` or `C:`) |
+| `-SourceVolume` | String | — | Drive letter to clone (e.g., `"C"` or `"C:"`) |
 | `-DestinationVHDX` | String | — | Full path for output VHDX file |
-| `-BootMode` | String | `UEFI` | Boot mode: `UEFI` (GPT) or `BIOS` (MBR) |
+| `-BootMode` | String | `"UEFI"` | Boot mode: `"UEFI"` (GPT) or `"BIOS"` (MBR) |
 | `-FullCopy` | Switch | `$false` | Copy all sectors instead of allocated only |
 | `-FixedSizeVHDX` | Switch | `$false` | Create fixed-size instead of dynamic VHDX |
 | `-BlockSizeMB` | Int | `4` | Copy block size in MB (1-64) |
@@ -98,31 +98,31 @@ Simply run the script without parameters for a menu-driven experience:
 ### Basic Clone (Smart Copy, Dynamic VHDX, UEFI)
 
 ```powershell
-.\Clone.ps1 -SourceVolume C -DestinationVHDX E:\VMs\Windows_Clone.vhdx
+.\Clone.ps1 -SourceVolume "C" -DestinationVHDX "E:\VMs\Windows_Clone.vhdx"
 ```
 
 ### Full Sector Copy
 
 ```powershell
-.\Clone.ps1 -SourceVolume C -DestinationVHDX E:\VMs\Full_Clone.vhdx -FullCopy
+.\Clone.ps1 -SourceVolume "C" -DestinationVHDX "E:\VMs\Full_Clone.vhdx" -FullCopy
 ```
 
 ### BIOS/MBR Boot Mode
 
 ```powershell
-.\Clone.ps1 -SourceVolume C -DestinationVHDX E:\VMs\BIOS_Clone.vhdx -BootMode BIOS
+.\Clone.ps1 -SourceVolume "C" -DestinationVHDX "E:\VMs\BIOS_Clone.vhdx" -BootMode "BIOS"
 ```
 
 ### Fixed-Size VHDX with Larger Block Size
 
 ```powershell
-.\Clone.ps1 -SourceVolume C -DestinationVHDX E:\VMs\Fixed_Clone.vhdx -FixedSizeVHDX -BlockSizeMB 16
+.\Clone.ps1 -SourceVolume "C" -DestinationVHDX "E:\VMs\Fixed_Clone.vhdx" -FixedSizeVHDX -BlockSizeMB 16
 ```
 
 ### Clone Secondary Drive (Data Only, No Boot Files)
 
 ```powershell
-.\Clone.ps1 -SourceVolume D -DestinationVHDX E:\VMs\Data_Clone.vhdx -SkipBootFix
+.\Clone.ps1 -SourceVolume "D" -DestinationVHDX "E:\VMs\Data_Clone.vhdx" -SkipBootFix
 ```
 
 ## Output
@@ -174,9 +174,9 @@ Installing boot files...
 Add the VHDX to Windows boot menu:
 
 ```powershell
-bcdedit /copy {current} /d "Windows Clone"
-bcdedit /set {NEW-GUID} device vhd=[D:]\VMs\Clone.vhdx
-bcdedit /set {NEW-GUID} osdevice vhd=[D:]\VMs\Clone.vhdx
+bcdedit /copy "{current}" /d "Windows Clone"
+bcdedit /set "{NEW-GUID}" device vhd="[D:]\VMs\Clone.vhdx"
+bcdedit /set "{NEW-GUID}" osdevice vhd="[D:]\VMs\Clone.vhdx"
 ```
 
 ### Mount for File Access
