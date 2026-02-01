@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 
 # ============================================================
-# Part 1: P/Invoke Definitions (with CreateFile for raw I/O)
+# Part 1: P/Invoke Definitions
 # ============================================================
 
 Add-Type -TypeDefinition @"
@@ -13,11 +13,13 @@ public static class VirtDisk
 {
     public const int VIRTUAL_STORAGE_TYPE_DEVICE_VHDX = 3;
     public const int CREATE_VIRTUAL_DISK_VERSION_2 = 2;
-    public const int OPEN_VIRTUAL_DISK_VERSION_2 = 2;
     public const int ATTACH_VIRTUAL_DISK_VERSION_1 = 1;
     
     public const uint VIRTUAL_DISK_ACCESS_ALL = 0x003f0000;
-    public const uint VIRTUAL_DISK_ACCESS_ATTACH_RW = 0x00020000;
+    
+    // Flag for dynamic/sparse VHDX
+    public const uint CREATE_VIRTUAL_DISK_FLAG_NONE = 0;
+    public const uint CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION = 1;
     
     [StructLayout(LayoutKind.Sequential)]
     public struct VIRTUAL_STORAGE_TYPE
@@ -44,15 +46,6 @@ public static class VirtDisk
     }
     
     [StructLayout(LayoutKind.Sequential)]
-    public struct OPEN_VIRTUAL_DISK_PARAMETERS
-    {
-        public int Version;
-        public bool GetInfoOnly;
-        public bool ReadOnly;
-        public Guid ResiliencyGuid;
-    }
-    
-    [StructLayout(LayoutKind.Sequential)]
     public struct ATTACH_VIRTUAL_DISK_PARAMETERS
     {
         public int Version;
@@ -72,15 +65,6 @@ public static class VirtDisk
         uint ProviderSpecificFlags,
         ref CREATE_VIRTUAL_DISK_PARAMETERS Parameters,
         IntPtr Overlapped,
-        out IntPtr Handle);
-    
-    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int OpenVirtualDisk(
-        ref VIRTUAL_STORAGE_TYPE VirtualStorageType,
-        string Path,
-        uint VirtualDiskAccessMask,
-        uint Flags,
-        ref OPEN_VIRTUAL_DISK_PARAMETERS Parameters,
         out IntPtr Handle);
     
     [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -110,7 +94,6 @@ public static class VirtDisk
 
 public static class NativeDisk
 {
-    // CreateFile constants
     public const uint GENERIC_READ = 0x80000000;
     public const uint GENERIC_WRITE = 0x40000000;
     public const uint FILE_SHARE_READ = 0x00000001;
@@ -120,16 +103,41 @@ public static class NativeDisk
     public const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
     public const uint FILE_ATTRIBUTE_NORMAL = 0x80;
     
-    // IOCTL codes
-    public const uint IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C;
-    public const uint FSCTL_LOCK_VOLUME = 0x00090018;
-    public const uint FSCTL_UNLOCK_VOLUME = 0x0009001C;
-    public const uint FSCTL_DISMOUNT_VOLUME = 0x00090020;
+    // FSCTL codes
+    public const uint FSCTL_GET_VOLUME_BITMAP = 0x0009006F;
+    public const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
     
     [StructLayout(LayoutKind.Sequential)]
-    public struct GET_LENGTH_INFORMATION
+    public struct NTFS_VOLUME_DATA_BUFFER
     {
-        public long Length;
+        public long VolumeSerialNumber;
+        public long NumberSectors;
+        public long TotalClusters;
+        public long FreeClusters;
+        public long TotalReserved;
+        public uint BytesPerSector;
+        public uint BytesPerCluster;
+        public uint BytesPerFileRecordSegment;
+        public uint ClustersPerFileRecordSegment;
+        public long MftValidDataLength;
+        public long MftStartLcn;
+        public long Mft2StartLcn;
+        public long MftZoneStart;
+        public long MftZoneEnd;
+    }
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STARTING_LCN_INPUT_BUFFER
+    {
+        public long StartingLcn;
+    }
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VOLUME_BITMAP_BUFFER
+    {
+        public long StartingLcn;
+        public long BitmapSize;
+        // Buffer follows - we handle this separately
     }
     
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -148,7 +156,7 @@ public static class NativeDisk
         uint dwIoControlCode,
         IntPtr lpInBuffer,
         uint nInBufferSize,
-        out GET_LENGTH_INFORMATION lpOutBuffer,
+        IntPtr lpOutBuffer,
         uint nOutBufferSize,
         out uint lpBytesReturned,
         IntPtr lpOverlapped);
@@ -157,7 +165,7 @@ public static class NativeDisk
     public static extern bool DeviceIoControl(
         SafeFileHandle hDevice,
         uint dwIoControlCode,
-        IntPtr lpInBuffer,
+        ref STARTING_LCN_INPUT_BUFFER lpInBuffer,
         uint nInBufferSize,
         IntPtr lpOutBuffer,
         uint nOutBufferSize,
@@ -192,22 +200,19 @@ public static class NativeDisk
 "@
 
 # ============================================================
-# Part 2: VSS Functions using CIM (modern replacement for WMI)
+# Part 2: VSS Functions
 # ============================================================
 
 function New-VssSnapshot {
     param(
         [Parameter(Mandatory)]
-        [string]$Volume  # e.g., "C:\"
+        [string]$Volume
     )
     
-    # Normalize volume path
     if (-not $Volume.EndsWith("\")) { $Volume += "\" }
     
     Write-Host "Creating VSS snapshot for $Volume..." -ForegroundColor Cyan
     
-    # Use CIM to create shadow copy (modern replacement for WMI)
-    $shadowClass = Get-CimClass -ClassName Win32_ShadowCopy
     $result = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{
         Volume = $Volume
         Context = "ClientAccessible"
@@ -217,7 +222,6 @@ function New-VssSnapshot {
         throw "Failed to create shadow copy. Error code: $($result.ReturnValue)"
     }
     
-    # Get the shadow copy object
     $shadowCopy = Get-CimInstance -ClassName Win32_ShadowCopy | 
         Where-Object { $_.ID -eq $result.ShadowID }
     
@@ -252,22 +256,31 @@ function New-RawVHDX {
         [string]$Path,
         
         [Parameter(Mandatory)]
-        [uint64]$SizeBytes
+        [uint64]$SizeBytes,
+        
+        [switch]$FixedSize
     )
     
-    Write-Host "Creating VHDX: $Path ($([math]::Round($SizeBytes/1GB, 2)) GB)..." -ForegroundColor Cyan
+    $typeStr = if ($FixedSize) { "Fixed" } else { "Dynamic" }
+    Write-Host "Creating $typeStr VHDX: $Path ($([math]::Round($SizeBytes/1GB, 2)) GB)..." -ForegroundColor Cyan
     
     $storageType = New-Object VirtDisk+VIRTUAL_STORAGE_TYPE
     $storageType.DeviceId = [VirtDisk]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
     $storageType.VendorId = [VirtDisk]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
     
     $params = New-Object VirtDisk+CREATE_VIRTUAL_DISK_PARAMETERS
-    $params.Version = [VirtDisk]::CREATE_VIRTUAL_DISK_VERSION_2
+    $params.Version = 2
     $params.MaximumSize = $SizeBytes
-    $params.BlockSizeInBytes = 0      # Default block size
-    $params.SectorSizeInBytes = 512   # Logical sector size
-    $params.PhysicalSectorSizeInBytes = 4096  # Physical sector size for 4Kn drives
+    $params.BlockSizeInBytes = 0
+    $params.SectorSizeInBytes = 512
+    $params.PhysicalSectorSizeInBytes = 4096
     $params.UniqueId = [Guid]::NewGuid()
+    
+    $flags = if ($FixedSize) { 
+        [VirtDisk]::CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION 
+    } else { 
+        [VirtDisk]::CREATE_VIRTUAL_DISK_FLAG_NONE 
+    }
     
     $handle = [IntPtr]::Zero
     $result = [VirtDisk]::CreateVirtualDisk(
@@ -275,7 +288,7 @@ function New-RawVHDX {
         $Path,
         [VirtDisk]::VIRTUAL_DISK_ACCESS_ALL,
         [IntPtr]::Zero,
-        0,   # CREATE_VIRTUAL_DISK_FLAG_NONE
+        $flags,
         0,
         [ref]$params,
         [IntPtr]::Zero,
@@ -298,14 +311,12 @@ function Mount-RawVHDX {
     Write-Host "Attaching VHDX..." -ForegroundColor Cyan
     
     $attachParams = New-Object VirtDisk+ATTACH_VIRTUAL_DISK_PARAMETERS
-    $attachParams.Version = [VirtDisk]::ATTACH_VIRTUAL_DISK_VERSION_1
+    $attachParams.Version = 1
     
-    # ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER = 1
-    # ATTACH_VIRTUAL_DISK_FLAG_PERMANENT_LIFETIME = 4 (optional, survives handle close)
     $result = [VirtDisk]::AttachVirtualDisk(
         $Handle,
         [IntPtr]::Zero,
-        1,   # NO_DRIVE_LETTER - we want raw access
+        1,   # NO_DRIVE_LETTER
         0,
         [ref]$attachParams,
         [IntPtr]::Zero
@@ -315,7 +326,6 @@ function Mount-RawVHDX {
         throw "AttachVirtualDisk failed with error: $result (0x$($result.ToString('X8')))"
     }
     
-    # Get the physical path (e.g., \\.\PhysicalDrive2)
     $pathSize = 520
     $pathBuilder = New-Object System.Text.StringBuilder -ArgumentList $pathSize
     $result = [VirtDisk]::GetVirtualDiskPhysicalPath($Handle, [ref]$pathSize, $pathBuilder)
@@ -334,15 +344,291 @@ function Dismount-RawVHDX {
     )
     
     Write-Host "Detaching VHDX..." -ForegroundColor Cyan
-    $result = [VirtDisk]::DetachVirtualDisk($Handle, 0, 0)
-    if ($result -ne 0) {
-        Write-Warning "DetachVirtualDisk returned: $result"
-    }
+    [VirtDisk]::DetachVirtualDisk($Handle, 0, 0) | Out-Null
     [VirtDisk]::CloseHandle($Handle) | Out-Null
 }
 
 # ============================================================
-# Part 4: Raw Disk I/O Functions
+# Part 4: Volume Bitmap Functions (Skip Free Space)
+# ============================================================
+
+function Get-NtfsVolumeData {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter
+    )
+    
+    $volumePath = "\\.\${DriveLetter}:"
+    
+    $handle = [NativeDisk]::CreateFile(
+        $volumePath,
+        [NativeDisk]::GENERIC_READ,
+        [NativeDisk]::FILE_SHARE_READ -bor [NativeDisk]::FILE_SHARE_WRITE,
+        [IntPtr]::Zero,
+        [NativeDisk]::OPEN_EXISTING,
+        0,
+        [IntPtr]::Zero
+    )
+    
+    if ($handle.IsInvalid) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open volume $volumePath. Error: $err"
+    }
+    
+    try {
+        $bufferSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][NativeDisk+NTFS_VOLUME_DATA_BUFFER])
+        $buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bufferSize)
+        
+        try {
+            $bytesReturned = [uint32]0
+            $success = [NativeDisk]::DeviceIoControl(
+                $handle,
+                [NativeDisk]::FSCTL_GET_NTFS_VOLUME_DATA,
+                [IntPtr]::Zero,
+                0,
+                $buffer,
+                $bufferSize,
+                [ref]$bytesReturned,
+                [IntPtr]::Zero
+            )
+            
+            if (-not $success) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "FSCTL_GET_NTFS_VOLUME_DATA failed. Error: $err"
+            }
+            
+            $volumeData = [System.Runtime.InteropServices.Marshal]::PtrToStructure(
+                $buffer, 
+                [type][NativeDisk+NTFS_VOLUME_DATA_BUFFER]
+            )
+            
+            return @{
+                TotalClusters = $volumeData.TotalClusters
+                FreeClusters = $volumeData.FreeClusters
+                BytesPerCluster = $volumeData.BytesPerCluster
+                BytesPerSector = $volumeData.BytesPerSector
+            }
+        }
+        finally {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
+        }
+    }
+    finally {
+        $handle.Close()
+    }
+}
+
+function Get-VolumeBitmap {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter,
+        
+        [Parameter(Mandatory)]
+        [long]$TotalClusters
+    )
+    
+    Write-Host "Reading volume allocation bitmap..." -ForegroundColor Cyan
+    
+    $volumePath = "\\.\${DriveLetter}:"
+    
+    $handle = [NativeDisk]::CreateFile(
+        $volumePath,
+        [NativeDisk]::GENERIC_READ,
+        [NativeDisk]::FILE_SHARE_READ -bor [NativeDisk]::FILE_SHARE_WRITE,
+        [IntPtr]::Zero,
+        [NativeDisk]::OPEN_EXISTING,
+        0,
+        [IntPtr]::Zero
+    )
+    
+    if ($handle.IsInvalid) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open volume. Error: $err"
+    }
+    
+    try {
+        # Calculate bitmap size (1 bit per cluster, round up to bytes)
+        $bitmapBytes = [long][math]::Ceiling($TotalClusters / 8.0)
+        $fullBitmap = New-Object byte[] $bitmapBytes
+        
+        $startingLcn = [long]0
+        $headerSize = 16  # Size of StartingLcn (8) + BitmapSize (8)
+        $chunkSize = 1MB  # Read bitmap in chunks
+        $outputBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($chunkSize)
+        $bitmapOffset = 0
+        
+        try {
+            while ($startingLcn -lt $TotalClusters) {
+                $inputBuffer = New-Object NativeDisk+STARTING_LCN_INPUT_BUFFER
+                $inputBuffer.StartingLcn = $startingLcn
+                
+                $bytesReturned = [uint32]0
+                $success = [NativeDisk]::DeviceIoControl(
+                    $handle,
+                    [NativeDisk]::FSCTL_GET_VOLUME_BITMAP,
+                    [ref]$inputBuffer,
+                    [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($inputBuffer),
+                    $outputBuffer,
+                    [uint32]$chunkSize,
+                    [ref]$bytesReturned,
+                    [IntPtr]::Zero
+                )
+                
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    # ERROR_MORE_DATA (234) is expected - we're reading in chunks
+                    if ($err -ne 234) {
+                        throw "FSCTL_GET_VOLUME_BITMAP failed. Error: $err"
+                    }
+                }
+                
+                # Parse header
+                $returnedStartLcn = [System.Runtime.InteropServices.Marshal]::ReadInt64($outputBuffer, 0)
+                $bitmapSize = [System.Runtime.InteropServices.Marshal]::ReadInt64($outputBuffer, 8)
+                
+                # Copy bitmap data
+                $dataBytes = [int]($bytesReturned - $headerSize)
+                if ($dataBytes -gt 0 -and ($bitmapOffset + $dataBytes) -le $fullBitmap.Length) {
+                    [System.Runtime.InteropServices.Marshal]::Copy(
+                        [IntPtr]::Add($outputBuffer, $headerSize),
+                        $fullBitmap,
+                        $bitmapOffset,
+                        $dataBytes
+                    )
+                    $bitmapOffset += $dataBytes
+                }
+                
+                # Move to next chunk (each byte represents 8 clusters)
+                $clustersRead = $dataBytes * 8
+                $startingLcn += $clustersRead
+                
+                # Progress
+                $pct = [math]::Min(100, [int](($startingLcn / $TotalClusters) * 100))
+                Write-Progress -Activity "Reading Bitmap" -Status "$pct%" -PercentComplete $pct
+            }
+            
+            Write-Progress -Activity "Reading Bitmap" -Completed
+        }
+        finally {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($outputBuffer)
+        }
+        
+        return $fullBitmap
+    }
+    finally {
+        $handle.Close()
+    }
+}
+
+function Get-AllocatedRanges {
+    param(
+        [Parameter(Mandatory)]
+        [byte[]]$Bitmap,
+        
+        [Parameter(Mandatory)]
+        [long]$TotalClusters,
+        
+        [Parameter(Mandatory)]
+        [uint32]$BytesPerCluster,
+        
+        [int]$MinRunClusters = 256  # Merge runs closer than this (1MB with 4K clusters)
+    )
+    
+    Write-Host "Analyzing allocation bitmap..." -ForegroundColor Cyan
+    
+    $ranges = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $currentStart = -1
+    $allocatedClusters = [long]0
+    
+    for ($cluster = 0; $cluster -lt $TotalClusters; $cluster++) {
+        $byteIndex = [math]::Floor($cluster / 8)
+        $bitIndex = $cluster % 8
+        
+        $isAllocated = ($Bitmap[$byteIndex] -band (1 -shl $bitIndex)) -ne 0
+        
+        if ($isAllocated) {
+            if ($currentStart -eq -1) {
+                $currentStart = $cluster
+            }
+            $allocatedClusters++
+        }
+        else {
+            if ($currentStart -ne -1) {
+                $ranges.Add([PSCustomObject]@{
+                    StartCluster = $currentStart
+                    EndCluster = $cluster - 1
+                    ClusterCount = $cluster - $currentStart
+                })
+                $currentStart = -1
+            }
+        }
+        
+        # Progress every 1%
+        if ($cluster % [math]::Max(1, [int]($TotalClusters / 100)) -eq 0) {
+            $pct = [int](($cluster / $TotalClusters) * 100)
+            Write-Progress -Activity "Analyzing Bitmap" -Status "$pct%" -PercentComplete $pct
+        }
+    }
+    
+    # Handle final range
+    if ($currentStart -ne -1) {
+        $ranges.Add([PSCustomObject]@{
+            StartCluster = $currentStart
+            EndCluster = $TotalClusters - 1
+            ClusterCount = $TotalClusters - $currentStart
+        })
+    }
+    
+    Write-Progress -Activity "Analyzing Bitmap" -Completed
+    
+    # Merge nearby ranges to reduce I/O operations
+    Write-Host "Merging adjacent ranges (threshold: $MinRunClusters clusters)..." -ForegroundColor Cyan
+    $mergedRanges = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $prev = $null
+    
+    foreach ($range in $ranges) {
+        if ($null -eq $prev) {
+            $prev = $range
+            continue
+        }
+        
+        $gap = $range.StartCluster - $prev.EndCluster - 1
+        if ($gap -le $MinRunClusters) {
+            # Merge
+            $prev = [PSCustomObject]@{
+                StartCluster = $prev.StartCluster
+                EndCluster = $range.EndCluster
+                ClusterCount = $range.EndCluster - $prev.StartCluster + 1
+            }
+        }
+        else {
+            $mergedRanges.Add($prev)
+            $prev = $range
+        }
+    }
+    if ($null -ne $prev) {
+        $mergedRanges.Add($prev)
+    }
+    
+    $totalBytes = $TotalClusters * $BytesPerCluster
+    $allocatedBytes = $allocatedClusters * $BytesPerCluster
+    $savingsPercent = [math]::Round((1 - ($allocatedBytes / $totalBytes)) * 100, 1)
+    
+    Write-Host "  Total clusters: $TotalClusters ($([math]::Round($totalBytes/1GB, 2)) GB)" -ForegroundColor DarkGray
+    Write-Host "  Allocated clusters: $allocatedClusters ($([math]::Round($allocatedBytes/1GB, 2)) GB)" -ForegroundColor DarkGray
+    Write-Host "  Ranges before merge: $($ranges.Count)" -ForegroundColor DarkGray
+    Write-Host "  Ranges after merge: $($mergedRanges.Count)" -ForegroundColor DarkGray
+    Write-Host "  Space savings: $savingsPercent%" -ForegroundColor Green
+    
+    return @{
+        Ranges = $mergedRanges
+        AllocatedClusters = $allocatedClusters
+        AllocatedBytes = $allocatedBytes
+    }
+}
+
+# ============================================================
+# Part 5: Raw Disk I/O
 # ============================================================
 
 function Open-RawDisk {
@@ -362,8 +648,6 @@ function Open-RawDisk {
     }
     
     $shareMode = [NativeDisk]::FILE_SHARE_READ -bor [NativeDisk]::FILE_SHARE_WRITE
-    
-    # Use unbuffered I/O for raw disk access
     $flags = [NativeDisk]::FILE_FLAG_NO_BUFFERING -bor [NativeDisk]::FILE_FLAG_WRITE_THROUGH
     
     $handle = [NativeDisk]::CreateFile(
@@ -384,215 +668,225 @@ function Open-RawDisk {
     return $handle
 }
 
-function Get-DiskLength {
-    param(
-        [Parameter(Mandatory)]
-        [Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle
-    )
-    
-    $lengthInfo = New-Object NativeDisk+GET_LENGTH_INFORMATION
-    $bytesReturned = 0
-    
-    $success = [NativeDisk]::DeviceIoControl(
-        $Handle,
-        [NativeDisk]::IOCTL_DISK_GET_LENGTH_INFO,
-        [IntPtr]::Zero,
-        0,
-        [ref]$lengthInfo,
-        [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($lengthInfo),
-        [ref]$bytesReturned,
-        [IntPtr]::Zero
-    )
-    
-    if (-not $success) {
-        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        throw "Failed to get disk length. Error: $err"
-    }
-    
-    return $lengthInfo.Length
-}
-
 # ============================================================
-# Part 5: Block Copy Function (Fixed)
+# Part 6: Sparse Block Copy (Skip Free Space)
 # ============================================================
 
-function Copy-VolumeBlocks {
+function Copy-AllocatedBlocks {
     param(
         [Parameter(Mandatory)]
-        [string]$SourcePath,      # VSS device path (NO trailing backslash!)
+        [string]$SourcePath,
         
         [Parameter(Mandatory)]
-        [string]$DestinationPath, # Physical disk path
+        [string]$DestinationPath,
         
         [Parameter(Mandatory)]
-        [uint64]$TotalBytes,
+        [System.Collections.Generic.List[PSCustomObject]]$Ranges,
         
-        [int]$BlockSize = 4MB     # Must be multiple of sector size (4KB for modern disks)
+        [Parameter(Mandatory)]
+        [uint32]$BytesPerCluster,
+        
+        [Parameter(Mandatory)]
+        [long]$AllocatedBytes,
+        
+        [int]$BlockSize = 4MB
     )
     
-    # Ensure block size is aligned to 4K sectors
-    if ($BlockSize % 4096 -ne 0) {
-        $BlockSize = [math]::Ceiling($BlockSize / 4096) * 4096
-        Write-Warning "Block size adjusted to $BlockSize for sector alignment"
+    # Ensure block size is cluster-aligned
+    if ($BlockSize % $BytesPerCluster -ne 0) {
+        $BlockSize = [int]([math]::Ceiling($BlockSize / $BytesPerCluster) * $BytesPerCluster)
     }
     
-    Write-Host "Copying $([math]::Round($TotalBytes/1GB, 2)) GB in $($BlockSize/1MB) MB blocks..." -ForegroundColor Cyan
+    $clustersPerBlock = $BlockSize / $BytesPerCluster
+    
+    Write-Host "Copying $([math]::Round($AllocatedBytes/1GB, 2)) GB of allocated data..." -ForegroundColor Cyan
+    Write-Host "  Block size: $($BlockSize/1MB) MB ($clustersPerBlock clusters)" -ForegroundColor DarkGray
     
     $sourceHandle = $null
     $destHandle = $null
     
     try {
-        # Open source (VSS snapshot) for reading
         $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
-        Write-Host "  Opened source: $SourcePath" -ForegroundColor DarkGray
-        
-        # Open destination (VHD physical disk) for writing
         $destHandle = Open-RawDisk -Path $DestinationPath -Access Write
-        Write-Host "  Opened destination: $DestinationPath" -ForegroundColor DarkGray
         
-        # Allocate aligned buffer
         $buffer = New-Object byte[] $BlockSize
-        $totalCopied = [uint64]0
-        $lastProgressPercent = -1
+        $totalCopied = [long]0
+        $rangeIndex = 0
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastProgressPercent = -1
         
-        while ($totalCopied -lt $TotalBytes) {
-            $bytesToRead = [Math]::Min($BlockSize, $TotalBytes - $totalCopied)
+        foreach ($range in $Ranges) {
+            $rangeIndex++
+            $clusterOffset = $range.StartCluster
+            $clustersRemaining = $range.ClusterCount
             
-            # Round up to sector size for unbuffered I/O
-            $alignedBytesToRead = [uint32]([math]::Ceiling($bytesToRead / 4096) * 4096)
-            
-            # Read from source
-            $bytesRead = [uint32]0
-            $success = [NativeDisk]::ReadFile($sourceHandle, $buffer, $alignedBytesToRead, [ref]$bytesRead, [IntPtr]::Zero)
-            
-            if (-not $success) {
-                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                throw "Read failed at offset $totalCopied. Error: $err"
-            }
-            
-            if ($bytesRead -eq 0) { 
-                Write-Warning "Unexpected end of source at offset $totalCopied"
-                break 
-            }
-            
-            # Write to destination
-            $bytesWritten = [uint32]0
-            $success = [NativeDisk]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)
-            
-            if (-not $success) {
-                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                throw "Write failed at offset $totalCopied. Error: $err"
-            }
-            
-            $totalCopied += $bytesRead
-            
-            # Progress reporting (update every 1%)
-            $progressPercent = [math]::Floor(($totalCopied / $TotalBytes) * 100)
-            if ($progressPercent -gt $lastProgressPercent) {
-                $elapsed = $stopwatch.Elapsed.TotalSeconds
-                $speed = if ($elapsed -gt 0) { $totalCopied / $elapsed / 1MB } else { 0 }
-                $remaining = if ($speed -gt 0) { ($TotalBytes - $totalCopied) / 1MB / $speed } else { 0 }
+            while ($clustersRemaining -gt 0) {
+                $clustersToRead = [math]::Min($clustersPerBlock, $clustersRemaining)
+                $bytesToRead = [uint32]($clustersToRead * $BytesPerCluster)
+                $byteOffset = [long]$clusterOffset * $BytesPerCluster
                 
-                Write-Progress -Activity "Cloning Volume" `
-                    -Status "$progressPercent% Complete - $([math]::Round($speed, 1)) MB/s - ETA: $([math]::Round($remaining/60, 1)) min" `
-                    -PercentComplete $progressPercent
-                $lastProgressPercent = $progressPercent
+                # Seek source
+                $newPos = [long]0
+                $success = [NativeDisk]::SetFilePointerEx($sourceHandle, $byteOffset, [ref]$newPos, [NativeDisk]::FILE_BEGIN)
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Source seek failed. Error: $err"
+                }
+                
+                # Read
+                $bytesRead = [uint32]0
+                $success = [NativeDisk]::ReadFile($sourceHandle, $buffer, $bytesToRead, [ref]$bytesRead, [IntPtr]::Zero)
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Read failed at cluster $clusterOffset. Error: $err"
+                }
+                
+                # Seek destination
+                $success = [NativeDisk]::SetFilePointerEx($destHandle, $byteOffset, [ref]$newPos, [NativeDisk]::FILE_BEGIN)
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Destination seek failed. Error: $err"
+                }
+                
+                # Write
+                $bytesWritten = [uint32]0
+                $success = [NativeDisk]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Write failed at cluster $clusterOffset. Error: $err"
+                }
+                
+                $totalCopied += $bytesRead
+                $clusterOffset += $clustersToRead
+                $clustersRemaining -= $clustersToRead
+                
+                # Progress
+                $progressPercent = [math]::Floor(($totalCopied / $AllocatedBytes) * 100)
+                if ($progressPercent -gt $lastProgressPercent) {
+                    $elapsed = $stopwatch.Elapsed.TotalSeconds
+                    $speed = if ($elapsed -gt 0) { $totalCopied / $elapsed / 1MB } else { 0 }
+                    $remaining = if ($speed -gt 0) { ($AllocatedBytes - $totalCopied) / 1MB / $speed } else { 0 }
+                    
+                    Write-Progress -Activity "Cloning Allocated Blocks" `
+                        -Status "$progressPercent% - $([math]::Round($speed, 1)) MB/s - ETA: $([math]::Round($remaining/60, 1)) min" `
+                        -PercentComplete $progressPercent
+                    $lastProgressPercent = $progressPercent
+                }
             }
         }
         
         $stopwatch.Stop()
-        Write-Progress -Activity "Cloning Volume" -Completed
+        Write-Progress -Activity "Cloning Allocated Blocks" -Completed
         
         $avgSpeed = $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB
-        Write-Host "Copied $([math]::Round($totalCopied/1GB, 2)) GB in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) minutes ($([math]::Round($avgSpeed, 1)) MB/s avg)" -ForegroundColor Green
+        Write-Host "Copied $([math]::Round($totalCopied/1GB, 2)) GB in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) min ($([math]::Round($avgSpeed, 1)) MB/s)" -ForegroundColor Green
     }
     finally {
-        if ($sourceHandle -and -not $sourceHandle.IsClosed) {
-            $sourceHandle.Close()
-        }
-        if ($destHandle -and -not $destHandle.IsClosed) {
-            $destHandle.Close()
-        }
+        if ($sourceHandle -and -not $sourceHandle.IsClosed) { $sourceHandle.Close() }
+        if ($destHandle -and -not $destHandle.IsClosed) { $destHandle.Close() }
     }
 }
 
 # ============================================================
-# Part 6: Main Clone Function
+# Part 7: Main Clone Function
 # ============================================================
 
 function New-LiveVolumeClone {
     param(
         [Parameter(Mandatory)]
-        [string]$SourceVolume,    # e.g., "C:"
+        [string]$SourceVolume,
         
         [Parameter(Mandatory)]
-        [string]$DestinationVHDX, # e.g., "D:\Backup\Clone.vhdx"
+        [string]$DestinationVHDX,
         
-        [int]$BlockSizeMB = 4     # Block size in MB (default 4MB)
+        [switch]$FullCopy,         # Skip free space optimization
+        [switch]$FixedSizeVHDX,    # Create fixed instead of dynamic VHDX
+        [int]$BlockSizeMB = 4
     )
     
     $vhdHandle = [IntPtr]::Zero
     $snapshot = $null
     
     try {
-        # Normalize source volume
         $driveLetter = $SourceVolume.TrimEnd(':', '\')
-        
-        # Get partition info for accurate size
         $partition = Get-Partition -DriveLetter $driveLetter
         $partitionSize = $partition.Size
         
-        Write-Host "`n=== Starting Live Volume Clone ===" -ForegroundColor Yellow
+        Write-Host "`n=== Live Volume Clone (Skip Free Space) ===" -ForegroundColor Yellow
         Write-Host "Source: ${driveLetter}:" -ForegroundColor White
         Write-Host "Destination: $DestinationVHDX" -ForegroundColor White
         Write-Host "Partition Size: $([math]::Round($partitionSize/1GB, 2)) GB" -ForegroundColor White
-        Write-Host "Block Size: $BlockSizeMB MB`n" -ForegroundColor White
+        Write-Host "Mode: $(if ($FullCopy) { 'Full Copy' } else { 'Skip Free Space' })`n" -ForegroundColor White
         
-        # Step 1: Create VSS Snapshot
+        # Get volume information
+        $volumeData = Get-NtfsVolumeData -DriveLetter $driveLetter
+        Write-Host "Cluster size: $($volumeData.BytesPerCluster) bytes" -ForegroundColor DarkGray
+        Write-Host "Total clusters: $($volumeData.TotalClusters)" -ForegroundColor DarkGray
+        Write-Host "Free clusters: $($volumeData.FreeClusters)`n" -ForegroundColor DarkGray
+        
+        # Create VSS Snapshot
         $snapshot = New-VssSnapshot -Volume "${driveLetter}:\"
         Write-Host "Snapshot created: $($snapshot.DeviceObject)" -ForegroundColor Green
         
-        # Step 2: Create VHDX (slightly larger to account for alignment)
+        # Create VHDX
         $vhdxSize = [math]::Ceiling($partitionSize / 1MB) * 1MB
-        $vhdHandle = New-RawVHDX -Path $DestinationVHDX -SizeBytes $vhdxSize
+        $vhdHandle = New-RawVHDX -Path $DestinationVHDX -SizeBytes $vhdxSize -FixedSize:$FixedSizeVHDX
         
-        # Step 3: Attach VHDX and get physical path
+        # Attach VHDX
         $physicalPath = Mount-RawVHDX -Handle $vhdHandle
-        Write-Host "VHDX attached at: $physicalPath" -ForegroundColor Green
+        Write-Host "VHDX attached at: $physicalPath`n" -ForegroundColor Green
         
-        # Wait for disk to be ready
         Start-Sleep -Seconds 3
         
-        # Step 4: Copy blocks from snapshot to VHDX
-        # NOTE: No trailing backslash on VSS device path for raw access!
-        Copy-VolumeBlocks `
-            -SourcePath $snapshot.DeviceObject `
-            -DestinationPath $physicalPath `
-            -TotalBytes $partitionSize `
-            -BlockSize ($BlockSizeMB * 1MB)
+        if ($FullCopy) {
+            # Full sector-by-sector copy (original behavior)
+            Copy-VolumeBlocksFull `
+                -SourcePath $snapshot.DeviceObject `
+                -DestinationPath $physicalPath `
+                -TotalBytes $partitionSize `
+                -BlockSize ($BlockSizeMB * 1MB)
+        }
+        else {
+            # Skip free space - copy only allocated clusters
+            $bitmap = Get-VolumeBitmap -DriveLetter $driveLetter -TotalClusters $volumeData.TotalClusters
+            
+            $allocation = Get-AllocatedRanges `
+                -Bitmap $bitmap `
+                -TotalClusters $volumeData.TotalClusters `
+                -BytesPerCluster $volumeData.BytesPerCluster `
+                -MinRunClusters 256
+            
+            Write-Host ""
+            
+            Copy-AllocatedBlocks `
+                -SourcePath $snapshot.DeviceObject `
+                -DestinationPath $physicalPath `
+                -Ranges $allocation.Ranges `
+                -BytesPerCluster $volumeData.BytesPerCluster `
+                -AllocatedBytes $allocation.AllocatedBytes `
+                -BlockSize ($BlockSizeMB * 1MB)
+        }
         
         Write-Host "`n=== Clone Complete ===" -ForegroundColor Yellow
         Write-Host "VHDX saved to: $DestinationVHDX" -ForegroundColor Green
-        Write-Host "You can mount this VHDX in Disk Management or Hyper-V" -ForegroundColor Cyan
+        
+        $vhdxFile = Get-Item $DestinationVHDX
+        Write-Host "VHDX file size: $([math]::Round($vhdxFile.Length/1GB, 2)) GB" -ForegroundColor Cyan
     }
     catch {
         Write-Error "Clone failed: $_"
         
-        # Clean up partial VHDX on failure
+        if ($vhdHandle -ne [IntPtr]::Zero) {
+            try { Dismount-RawVHDX -Handle $vhdHandle } catch { }
+            $vhdHandle = [IntPtr]::Zero
+        }
+        
         if (Test-Path $DestinationVHDX) {
-            Write-Host "Cleaning up partial VHDX..." -ForegroundColor Yellow
-            # Need to dismount first if attached
-            if ($vhdHandle -ne [IntPtr]::Zero) {
-                try { Dismount-RawVHDX -Handle $vhdHandle } catch { }
-                $vhdHandle = [IntPtr]::Zero
-            }
             Remove-Item $DestinationVHDX -Force -ErrorAction SilentlyContinue
         }
         throw
     }
     finally {
-        # Cleanup
         if ($vhdHandle -ne [IntPtr]::Zero) {
             Dismount-RawVHDX -Handle $vhdHandle
         }
@@ -603,9 +897,120 @@ function New-LiveVolumeClone {
     }
 }
 
+# Full copy function (for -FullCopy switch)
+function Copy-VolumeBlocksFull {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [uint64]$TotalBytes,
+        [int]$BlockSize = 4MB
+    )
+    
+    Write-Host "Performing full sector copy of $([math]::Round($TotalBytes/1GB, 2)) GB..." -ForegroundColor Cyan
+    
+    $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
+    $destHandle = Open-RawDisk -Path $DestinationPath -Access Write
+    
+    try {
+        $buffer = New-Object byte[] $BlockSize
+        $totalCopied = [uint64]0
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastPct = -1
+        
+        while ($totalCopied -lt $TotalBytes) {
+            $bytesToRead = [uint32][Math]::Min($BlockSize, $TotalBytes - $totalCopied)
+            $alignedBytes = [uint32]([math]::Ceiling($bytesToRead / 4096) * 4096)
+            
+            $bytesRead = [uint32]0
+            if (-not [NativeDisk]::ReadFile($sourceHandle, $buffer, $alignedBytes, [ref]$bytesRead, [IntPtr]::Zero)) {
+                throw "Read failed at offset $totalCopied. Error: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            }
+            
+            if ($bytesRead -eq 0) { break }
+            
+            $bytesWritten = [uint32]0
+            if (-not [NativeDisk]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
+                throw "Write failed at offset $totalCopied. Error: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            }
+            
+            $totalCopied += $bytesRead
+            
+            $pct = [math]::Floor(($totalCopied / $TotalBytes) * 100)
+            if ($pct -gt $lastPct) {
+                $speed = $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB
+                Write-Progress -Activity "Full Clone" -Status "$pct% - $([math]::Round($speed,1)) MB/s" -PercentComplete $pct
+                $lastPct = $pct
+            }
+        }
+        
+        Write-Progress -Activity "Full Clone" -Completed
+        $avgSpeed = $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB
+        Write-Host "Copied $([math]::Round($totalCopied/1GB, 2)) GB in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) min ($([math]::Round($avgSpeed, 1)) MB/s)" -ForegroundColor Green
+    }
+    finally {
+        if (-not $sourceHandle.IsClosed) { $sourceHandle.Close() }
+        if (-not $destHandle.IsClosed) { $destHandle.Close() }
+    }
+}
+
 # ============================================================
-# Usage
+# Usage Examples
 # ============================================================
 
-# Clone the C: drive to a VHDX file
-# New-LiveVolumeClone -SourceVolume "C:" -DestinationVHDX "D:\Backups\SystemClone.vhdx" -BlockSizeMB 4
+<#
+# Clone C: drive, skipping free space (default, fastest)
+New-LiveVolumeClone -SourceVolume "C:" -DestinationVHDX "D:\Backups\SystemClone.vhdx"
+
+# Clone with full sector copy (no optimization)
+New-LiveVolumeClone -SourceVolume "C:" -DestinationVHDX "D:\Backups\FullClone.vhdx" -FullCopy
+
+# Clone to a fixed-size VHDX
+New-LiveVolumeClone -SourceVolume "C:" -DestinationVHDX "D:\Backups\Fixed.vhdx" -FixedSizeVHDX
+
+# Clone with larger block size for faster I/O
+New-LiveVolumeClone -SourceVolume "C:" -DestinationVHDX "D:\Backups\Fast.vhdx" -BlockSizeMB 16
+#>
+```
+
+## Key Features Added
+
+| Feature | Description |
+|---------|-------------|
+| **FSCTL_GET_VOLUME_BITMAP** | Reads NTFS allocation bitmap to identify used clusters |
+| **FSCTL_GET_NTFS_VOLUME_DATA** | Gets cluster size and volume geometry |
+| **Range merging** | Combines nearby allocated ranges to reduce seek operations |
+| **Dynamic VHDX** | Default creates sparse VHDX that only stores written blocks |
+| **Progress with ETA** | Shows speed and estimated time remaining |
+
+## Example Output
+```
+=== Live Volume Clone (Skip Free Space) ===
+Source: C:
+Destination: D:\Backups\SystemClone.vhdx
+Partition Size: 237.5 GB
+Mode: Skip Free Space
+
+Cluster size: 4096 bytes
+Total clusters: 62256127
+Free clusters: 41502845
+
+Creating VSS snapshot for C:\...
+Snapshot created: \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy3
+Creating Dynamic VHDX: D:\Backups\SystemClone.vhdx (237.5 GB)...
+VHDX attached at: \\.\PhysicalDrive2
+
+Reading volume allocation bitmap...
+Analyzing allocation bitmap...
+  Total clusters: 62256127 (237.5 GB)
+  Allocated clusters: 20753282 (79.2 GB)
+  Ranges before merge: 847291
+  Ranges after merge: 12847
+  Space savings: 66.7%
+
+Copying 79.2 GB of allocated data...
+  Block size: 4 MB (1024 clusters)
+Copied 79.2 GB in 8.3 min (159.4 MB/s)
+
+=== Clone Complete ===
+VHDX saved to: D:\Backups\SystemClone.vhdx
+VHDX file size: 79.8 GB
