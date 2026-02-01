@@ -57,7 +57,6 @@ param(
 # Initialization
 # ============================================================
 
-# Set encoding safely (may fail in ISE or non-console hosts)
 try {
     if ($null -ne [Console]::OutputEncoding) {
         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -72,8 +71,7 @@ try {
 }
 catch { }
 
-# Check for admin rights
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$currentPrincipal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList ([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "This script requires Administrator privileges. Please run as Administrator."
 }
@@ -262,7 +260,6 @@ public static class NativeDisk
 }
 '@
 
-# Add types with error handling for re-runs
 $typesLoaded = $false
 try {
     $null = [VirtDisk].Name
@@ -298,13 +295,14 @@ function Show-Banner {
 }
 
 function Get-VolumeList {
-    $volumes = Get-Volume | Where-Object { 
+    # Force result to array with @() for PS5 compatibility
+    $volumeList = @(Get-Volume | Where-Object { 
         $_.DriveLetter -and 
         $_.DriveType -eq 'Fixed' -and
         $_.Size -gt 0
-    } | Sort-Object DriveLetter
+    } | Sort-Object DriveLetter)
     
-    return $volumes
+    return $volumeList
 }
 
 function Show-VolumeMenu {
@@ -326,11 +324,10 @@ function Show-VolumeMenu {
         
         $label = if ($vol.FileSystemLabel) { $vol.FileSystemLabel } else { "Local Disk" }
         
-        # Create a simple progress bar
         $barLength = 20
         $filledLength = [math]::Round(($usedPct / 100) * $barLength)
         $emptyLength = $barLength - $filledLength
-        $progressBar = "[" + ("█" * $filledLength) + ("░" * $emptyLength) + "]"
+        $progressBar = "[" + ([string]::new([char]0x2588, $filledLength)) + ([string]::new([char]0x2591, $emptyLength)) + "]"
         
         Write-Host "    [$index] " -ForegroundColor Yellow -NoNewline
         Write-Host "$($vol.DriveLetter):" -ForegroundColor White -NoNewline
@@ -350,12 +347,18 @@ function Show-VolumeMenu {
     Write-Host ""
 }
 
-function Read-ValidatedInput {
+function Read-MenuSelection {
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Prompt,
-        [string]$Default = "",
-        [scriptblock]$Validator = { $true },
-        [string]$ErrorMessage = "Invalid input. Please try again."
+        
+        [Parameter(Mandatory = $true)]
+        [int]$Min,
+        
+        [Parameter(Mandatory = $true)]
+        [int]$Max,
+        
+        [string]$Default = ""
     )
     
     while ($true) {
@@ -365,27 +368,74 @@ function Read-ValidatedInput {
             Write-Host ": " -ForegroundColor White -NoNewline
         }
         else {
-            Write-Host "  $Prompt`: " -ForegroundColor White -NoNewline
+            Write-Host "  ${Prompt}: " -ForegroundColor White -NoNewline
         }
         
-        $input = Read-Host
+        $userInput = Read-Host
         
-        if ([string]::IsNullOrWhiteSpace($input) -and $Default) {
-            $input = $Default
+        if ([string]::IsNullOrWhiteSpace($userInput) -and $Default) {
+            $userInput = $Default
         }
         
-        if (-not [string]::IsNullOrWhiteSpace($input) -and (& $Validator $input)) {
-            return $input
+        $num = 0
+        if ([int]::TryParse($userInput, [ref]$num)) {
+            if ($num -ge $Min -and $num -le $Max) {
+                return $num
+            }
         }
         
-        Write-Host "  $ErrorMessage" -ForegroundColor Red
+        Write-Host "  Please enter a number between $Min and $Max" -ForegroundColor Red
         Write-Host ""
+    }
+}
+
+function Read-PathInput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+        
+        [string]$Default = "",
+        
+        [string]$RequiredExtension = ""
+    )
+    
+    while ($true) {
+        if ($Default) {
+            Write-Host "  $Prompt" -ForegroundColor White
+            Write-Host "  [$Default]" -ForegroundColor DarkGray
+            Write-Host "  : " -ForegroundColor White -NoNewline
+        }
+        else {
+            Write-Host "  ${Prompt}: " -ForegroundColor White -NoNewline
+        }
+        
+        $userInput = Read-Host
+        
+        if ([string]::IsNullOrWhiteSpace($userInput) -and $Default) {
+            $userInput = $Default
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($userInput)) {
+            Write-Host "  Path cannot be empty." -ForegroundColor Red
+            Write-Host ""
+            continue
+        }
+        
+        if ($RequiredExtension -and -not $userInput.ToLower().EndsWith($RequiredExtension.ToLower())) {
+            Write-Host "  Path must end with $RequiredExtension" -ForegroundColor Red
+            Write-Host ""
+            continue
+        }
+        
+        return $userInput
     }
 }
 
 function Read-YesNo {
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Prompt,
+        
         [bool]$Default = $false
     )
     
@@ -395,13 +445,41 @@ function Read-YesNo {
     Write-Host "[$defaultStr]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     
-    $input = Read-Host
+    $userInput = Read-Host
     
-    if ([string]::IsNullOrWhiteSpace($input)) {
+    if ([string]::IsNullOrWhiteSpace($userInput)) {
         return $Default
     }
     
-    return $input.Trim().ToLower() -in @('y', 'yes', '1', 'true')
+    return $userInput.Trim().ToLower() -in @('y', 'yes', '1', 'true')
+}
+
+function Read-BlockSize {
+    param(
+        [int]$Default = 4
+    )
+    
+    while ($true) {
+        Write-Host "  Block size in MB (1-64) " -ForegroundColor White -NoNewline
+        Write-Host "[$Default]" -ForegroundColor DarkGray -NoNewline
+        Write-Host ": " -ForegroundColor White -NoNewline
+        
+        $userInput = Read-Host
+        
+        if ([string]::IsNullOrWhiteSpace($userInput)) {
+            return $Default
+        }
+        
+        $num = 0
+        if ([int]::TryParse($userInput, [ref]$num)) {
+            if ($num -ge 1 -and $num -le 64) {
+                return $num
+            }
+        }
+        
+        Write-Host "  Please enter a number between 1 and 64" -ForegroundColor Red
+        Write-Host ""
+    }
 }
 
 function Show-OptionsMenu {
@@ -491,17 +569,17 @@ function Show-Summary {
 function Start-InteractiveMode {
     $selectedVolume = $null
     $destinationPath = $null
-    $fullCopy = $false
-    $fixedSizeVHDX = $false
-    $blockSizeMB = 4
+    $optFullCopy = $false
+    $optFixedSizeVHDX = $false
+    $optBlockSizeMB = 4
     
-    # Volume Selection Loop
     :volumeLoop while ($true) {
         Show-Banner
         
         $volumes = Get-VolumeList
+        $volumeCount = $volumes.Count
         
-        if ($volumes.Count -eq 0) {
+        if ($volumeCount -eq 0) {
             Write-Host "  No suitable volumes found!" -ForegroundColor Red
             Write-Host "  Press any key to exit..." -ForegroundColor Gray
             $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
@@ -510,61 +588,37 @@ function Start-InteractiveMode {
         
         Show-VolumeMenu -Volumes $volumes
         
-        $selection = Read-ValidatedInput -Prompt "Select a volume to clone" -Validator {
-            param($val)
-            $num = 0
-            if ([int]::TryParse($val, [ref]$num)) {
-                return $num -ge 0 -and $num -le $volumes.Count
-            }
-            return $false
-        } -ErrorMessage "Please enter a number between 0 and $($volumes.Count)"
+        $selection = Read-MenuSelection -Prompt "Select a volume to clone" -Min 0 -Max $volumeCount
         
-        if ($selection -eq "0") {
+        if ($selection -eq 0) {
             Write-Host ""
             Write-Host "  Goodbye!" -ForegroundColor Cyan
             return
         }
         
-        $selectedVolume = $volumes[[int]$selection - 1].DriveLetter
-        $volumeInfo = $volumes[[int]$selection - 1]
+        $selectedVolume = $volumes[$selection - 1].DriveLetter
+        $volumeInfo = $volumes[$selection - 1]
         
         # Default destination path
         $defaultName = "Clone_${selectedVolume}_$(Get-Date -Format 'yyyyMMdd_HHmmss').vhdx"
         
         # Find a suitable destination drive (not the source)
-        $destDrive = Get-Volume | Where-Object { 
+        $destDrive = @(Get-Volume | Where-Object { 
             $_.DriveLetter -and 
             $_.DriveLetter -ne $selectedVolume -and 
             $_.DriveType -eq 'Fixed' -and
             $_.SizeRemaining -gt ($volumeInfo.Size - $volumeInfo.SizeRemaining + 1GB)
-        } | Sort-Object SizeRemaining -Descending | Select-Object -First 1
+        } | Sort-Object SizeRemaining -Descending | Select-Object -First 1)
         
-        if ($destDrive) {
-            $defaultPath = "$($destDrive.DriveLetter):\Backups\$defaultName"
+        if ($destDrive -and $destDrive.Count -gt 0) {
+            $defaultPath = "$($destDrive[0].DriveLetter):\Backups\$defaultName"
         }
         else {
             $defaultPath = "${selectedVolume}:\Backups\$defaultName"
         }
         
         Write-Host ""
-        $destinationPath = Read-ValidatedInput `
-            -Prompt "Destination VHDX path" `
-            -Default $defaultPath `
-            -Validator {
-                param($val)
-                # Check if path ends with .vhdx
-                if (-not $val.ToLower().EndsWith('.vhdx')) {
-                    return $false
-                }
-                # Check if directory is valid
-                $dir = Split-Path -Path $val -Parent
-                if ($dir -and -not (Test-Path -LiteralPath $dir -IsValid)) {
-                    return $false
-                }
-                # Check we're not trying to write to the source volume root
-                return $true
-            } `
-            -ErrorMessage "Please enter a valid path ending with .vhdx"
+        $destinationPath = Read-PathInput -Prompt "Destination VHDX path" -Default $defaultPath -RequiredExtension ".vhdx"
         
         # Options Loop
         :optionsLoop while ($true) {
@@ -579,55 +633,34 @@ function Start-InteractiveMode {
             Write-Host "$destinationPath" -ForegroundColor White
             
             Show-OptionsMenu -SourceVolume $selectedVolume -DestinationPath $destinationPath `
-                -FullCopy $fullCopy -FixedSizeVHDX $fixedSizeVHDX -BlockSizeMB $blockSizeMB
+                -FullCopy $optFullCopy -FixedSizeVHDX $optFixedSizeVHDX -BlockSizeMB $optBlockSizeMB
             
             Write-Host "  Enter choice: " -ForegroundColor White -NoNewline
             $choice = Read-Host
             
             switch ($choice.ToUpper()) {
                 "1" {
-                    $fullCopy = -not $fullCopy
+                    $optFullCopy = -not $optFullCopy
                 }
                 "2" {
-                    $fixedSizeVHDX = -not $fixedSizeVHDX
+                    $optFixedSizeVHDX = -not $optFixedSizeVHDX
                 }
                 "3" {
                     Write-Host ""
-                    $newSize = Read-ValidatedInput `
-                        -Prompt "Block size in MB (1-64)" `
-                        -Default $blockSizeMB.ToString() `
-                        -Validator {
-                            param($val)
-                            $num = 0
-                            if ([int]::TryParse($val, [ref]$num)) {
-                                return $num -ge 1 -and $num -le 64
-                            }
-                            return $false
-                        } `
-                        -ErrorMessage "Please enter a number between 1 and 64"
-                    $blockSizeMB = [int]$newSize
+                    $optBlockSizeMB = Read-BlockSize -Default $optBlockSizeMB
                 }
                 "C" {
                     Write-Host ""
-                    $destinationPath = Read-ValidatedInput `
-                        -Prompt "New destination VHDX path" `
-                        -Default $destinationPath `
-                        -Validator {
-                            param($val)
-                            return $val.ToLower().EndsWith('.vhdx')
-                        } `
-                        -ErrorMessage "Please enter a valid path ending with .vhdx"
+                    $destinationPath = Read-PathInput -Prompt "New destination VHDX path" -Default $destinationPath -RequiredExtension ".vhdx"
                 }
                 "B" {
                     continue volumeLoop
                 }
                 "S" {
-                    # Show summary and confirm
                     Show-Banner
                     Show-Summary -SourceVolume $selectedVolume -DestinationPath $destinationPath `
-                        -FullCopy $fullCopy -FixedSizeVHDX $fixedSizeVHDX -BlockSizeMB $blockSizeMB
+                        -FullCopy $optFullCopy -FixedSizeVHDX $optFixedSizeVHDX -BlockSizeMB $optBlockSizeMB
                     
-                    # Check if destination exists
                     if (Test-Path -LiteralPath $destinationPath) {
                         Write-Host "  WARNING: Destination file already exists!" -ForegroundColor Yellow
                         $overwrite = Read-YesNo -Prompt "Overwrite existing file?" -Default $false
@@ -637,7 +670,6 @@ function Start-InteractiveMode {
                         Remove-Item -LiteralPath $destinationPath -Force
                     }
                     
-                    # Check destination directory
                     $destDir = Split-Path -Path $destinationPath -Parent
                     if ($destDir -and -not (Test-Path -LiteralPath $destDir)) {
                         Write-Host "  Destination directory will be created: $destDir" -ForegroundColor DarkYellow
@@ -651,14 +683,13 @@ function Start-InteractiveMode {
                         Write-Host "  Starting clone operation..." -ForegroundColor Cyan
                         Write-Host ""
                         
-                        # Execute the clone
                         try {
                             New-LiveVolumeClone `
                                 -SourceVolume $selectedVolume `
                                 -DestinationVHDX $destinationPath `
-                                -FullCopy:$fullCopy `
-                                -FixedSizeVHDX:$fixedSizeVHDX `
-                                -BlockSizeMB $blockSizeMB
+                                -FullCopy:$optFullCopy `
+                                -FixedSizeVHDX:$optFixedSizeVHDX `
+                                -BlockSizeMB $optBlockSizeMB
                             
                             Write-Host ""
                             Write-Host "  ════════════════════════════════════════════════════════════" -ForegroundColor Green
@@ -676,7 +707,6 @@ function Start-InteractiveMode {
                         Write-Host "  Press any key to continue..." -ForegroundColor Gray
                         $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
                         
-                        # Ask if they want to do another clone
                         Write-Host ""
                         $another = Read-YesNo -Prompt "Clone another volume?" -Default $false
                         if ($another) {
@@ -1556,14 +1586,12 @@ function New-LiveVolumeClone {
 # Script Entry Point
 # ============================================================
 
-# Determine if we should run interactively
 $runInteractive = $false
 
 if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
     $runInteractive = $true
 }
 elseif (-not $SourceVolume -and -not $DestinationVHDX) {
-    # No parameters provided
     $runInteractive = $true
 }
 
@@ -1571,7 +1599,6 @@ if ($runInteractive) {
     Start-InteractiveMode
 }
 else {
-    # Validate required parameters for command-line mode
     if (-not $SourceVolume) {
         throw "SourceVolume is required in command-line mode. Use -Interactive for menu mode."
     }
@@ -1579,7 +1606,6 @@ else {
         throw "DestinationVHDX is required in command-line mode. Use -Interactive for menu mode."
     }
     
-    # Run the clone
     New-LiveVolumeClone `
         -SourceVolume $SourceVolume `
         -DestinationVHDX $DestinationVHDX `
