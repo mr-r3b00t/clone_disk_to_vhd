@@ -4,104 +4,178 @@
 <#
 .SYNOPSIS
     Clone a live Windows volume to a bootable VHDX file.
+.DESCRIPTION
+    Creates a VSS snapshot of a running Windows volume and copies it to a bootable
+    VHDX virtual disk. The resulting VHDX can be used in Hyper-V or for Native VHD Boot.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Interactive')]
 param(
-    [Parameter(ParameterSetName = 'CommandLine')][string]$SourceVolume,
-    [Parameter(ParameterSetName = 'CommandLine')][string]$DestinationVHDX,
-    [Parameter(ParameterSetName = 'CommandLine')][ValidateSet('UEFI', 'BIOS')][string]$BootMode = 'UEFI',
-    [Parameter(ParameterSetName = 'CommandLine')][switch]$FullCopy,
-    [Parameter(ParameterSetName = 'CommandLine')][switch]$FixedSizeVHDX,
-    [Parameter(ParameterSetName = 'CommandLine')][ValidateRange(1, 64)][int]$BlockSizeMB = 4,
-    [Parameter(ParameterSetName = 'CommandLine')][switch]$SkipBootFix,
-    [Parameter(ParameterSetName = 'Interactive')][switch]$Interactive
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [string]$SourceVolume,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [string]$DestinationVHDX,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [ValidateSet('UEFI', 'BIOS')]
+    [string]$BootMode = 'UEFI',
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$FullCopy,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$FixedSizeVHDX,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [ValidateRange(1, 64)]
+    [int]$BlockSizeMB = 4,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$SkipBootFix,
+    
+    [Parameter(ParameterSetName = 'Interactive')]
+    [switch]$Interactive
 )
 
-$ErrorActionPreference = 'Stop'
+# ============================================================
+# Initialization
+# ============================================================
 
-try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try {
+    if ($null -ne [Console]::OutputEncoding) {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    }
+}
+catch { }
 
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$currentPrincipal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList ([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "This script requires Administrator privileges."
 }
 
-#region Helper Functions
+# ============================================================
+# Helper Functions
+# ============================================================
 
-function Get-ClampedPercent([double]$Current, [double]$Total) {
-    if ($Total -le 0) { return 0 }
-    return [int][math]::Min(100, [math]::Max(0, [math]::Floor(($Current / $Total) * 100)))
+function Get-SafeCount {
+    param([object]$Collection)
+    return [int]($Collection | Measure-Object).Count
 }
 
 function Wait-KeyPress {
-    Write-Host "  Press Enter to continue..." -ForegroundColor Gray
-    $null = Read-Host
-}
-
-function Get-AvailableDriveLetter {
-    $used = @()
-    Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { $used += $_.DriveLetter }
-    Get-CimInstance Win32_MappedLogicalDisk -ErrorAction SilentlyContinue | ForEach-Object { 
-        if ($_.DeviceID) { $used += $_.DeviceID[0] }
-    }
+    param([string]$Message = "Press any key to continue...")
     
-    foreach ($l in 'S','T','U','V','W','X','Y','Z') {
-        if ($l -cnotin $used -and -not (Test-Path "${l}:\")) {
-            return $l
+    Write-Host "  $Message" -ForegroundColor Gray
+    
+    try {
+        if ($Host.Name -eq 'ConsoleHost') {
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        }
+        else {
+            Read-Host
         }
     }
-    return $null
+    catch {
+        Read-Host
+    }
 }
 
-#endregion
+# ============================================================
+# P/Invoke Definitions
+# ============================================================
 
-#region P/Invoke
-
-$nativeCode = @'
+$nativeCodeDefinition = @'
 using System;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public static class VirtDiskApi {
+public static class VirtDiskApi
+{
     public const uint VIRTUAL_DISK_ACCESS_ALL = 0x003f0000;
+    
     public const uint CREATE_VIRTUAL_DISK_FLAG_NONE = 0;
     public const uint CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION = 1;
+    
     public const uint ATTACH_VIRTUAL_DISK_FLAG_NONE = 0;
     public const uint ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER = 1;
+    
     public const uint OPEN_VIRTUAL_DISK_FLAG_NONE = 0;
+    
     public const int VIRTUAL_STORAGE_TYPE_DEVICE_VHDX = 3;
-    public static readonly Guid VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT = new Guid("EC984AEC-A0F9-47e9-901F-71415A66345B");
-
+    
+    public static readonly Guid VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT = 
+        new Guid("EC984AEC-A0F9-47e9-901F-71415A66345B");
+    
     [StructLayout(LayoutKind.Sequential)]
-    public struct VIRTUAL_STORAGE_TYPE { public int DeviceId; public Guid VendorId; }
-
+    public struct VIRTUAL_STORAGE_TYPE
+    {
+        public int DeviceId;
+        public Guid VendorId;
+    }
+    
     [StructLayout(LayoutKind.Sequential)]
-    public struct ATTACH_VIRTUAL_DISK_PARAMETERS { public int Version; public int Reserved; }
-
+    public struct ATTACH_VIRTUAL_DISK_PARAMETERS
+    {
+        public int Version;
+        public int Reserved;
+    }
+    
     [StructLayout(LayoutKind.Sequential)]
-    public struct OPEN_VIRTUAL_DISK_PARAMETERS { public int Version; public int RWDepth; }
-
+    public struct OPEN_VIRTUAL_DISK_PARAMETERS
+    {
+        public int Version;
+        public int RWDepth;
+    }
+    
     [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int CreateVirtualDisk(ref VIRTUAL_STORAGE_TYPE VirtualStorageType, string Path, uint VirtualDiskAccessMask, IntPtr SecurityDescriptor, uint Flags, uint ProviderSpecificFlags, IntPtr Parameters, IntPtr Overlapped, out IntPtr Handle);
-
+    public static extern int CreateVirtualDisk(
+        ref VIRTUAL_STORAGE_TYPE VirtualStorageType,
+        string Path,
+        uint VirtualDiskAccessMask,
+        IntPtr SecurityDescriptor,
+        uint Flags,
+        uint ProviderSpecificFlags,
+        IntPtr Parameters,
+        IntPtr Overlapped,
+        out IntPtr Handle);
+    
     [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int OpenVirtualDisk(ref VIRTUAL_STORAGE_TYPE VirtualStorageType, string Path, uint VirtualDiskAccessMask, uint Flags, ref OPEN_VIRTUAL_DISK_PARAMETERS Parameters, out IntPtr Handle);
-
+    public static extern int OpenVirtualDisk(
+        ref VIRTUAL_STORAGE_TYPE VirtualStorageType,
+        string Path,
+        uint VirtualDiskAccessMask,
+        uint Flags,
+        ref OPEN_VIRTUAL_DISK_PARAMETERS Parameters,
+        out IntPtr Handle);
+    
     [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int AttachVirtualDisk(IntPtr VirtualDiskHandle, IntPtr SecurityDescriptor, uint Flags, uint ProviderSpecificFlags, ref ATTACH_VIRTUAL_DISK_PARAMETERS Parameters, IntPtr Overlapped);
-
+    public static extern int AttachVirtualDisk(
+        IntPtr VirtualDiskHandle,
+        IntPtr SecurityDescriptor,
+        uint Flags,
+        uint ProviderSpecificFlags,
+        ref ATTACH_VIRTUAL_DISK_PARAMETERS Parameters,
+        IntPtr Overlapped);
+    
     [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int DetachVirtualDisk(IntPtr VirtualDiskHandle, uint Flags, uint ProviderSpecificFlags);
-
+    public static extern int DetachVirtualDisk(
+        IntPtr VirtualDiskHandle,
+        uint Flags,
+        uint ProviderSpecificFlags);
+    
     [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int GetVirtualDiskPhysicalPath(IntPtr VirtualDiskHandle, ref int DiskPathSizeInBytes, IntPtr DiskPath);
-
+    public static extern int GetVirtualDiskPhysicalPath(
+        IntPtr VirtualDiskHandle,
+        ref int DiskPathSizeInBytes,
+        IntPtr DiskPath);
+    
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
 }
 
-public static class NativeDiskApi {
+public static class NativeDiskApi
+{
     public const uint GENERIC_READ = 0x80000000;
     public const uint GENERIC_WRITE = 0x40000000;
     public const uint FILE_SHARE_READ = 0x00000001;
@@ -109,467 +183,969 @@ public static class NativeDiskApi {
     public const uint OPEN_EXISTING = 3;
     public const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
     public const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
+    
     public const uint FSCTL_GET_VOLUME_BITMAP = 0x0009006F;
     public const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
-    public const uint FILE_BEGIN = 0;
-
+    
     [StructLayout(LayoutKind.Sequential)]
-    public struct NTFS_VOLUME_DATA_BUFFER {
-        public long VolumeSerialNumber, NumberSectors, TotalClusters, FreeClusters, TotalReserved;
-        public uint BytesPerSector, BytesPerCluster, BytesPerFileRecordSegment, ClustersPerFileRecordSegment;
-        public long MftValidDataLength, MftStartLcn, Mft2StartLcn, MftZoneStart, MftZoneEnd;
+    public struct NTFS_VOLUME_DATA_BUFFER
+    {
+        public long VolumeSerialNumber;
+        public long NumberSectors;
+        public long TotalClusters;
+        public long FreeClusters;
+        public long TotalReserved;
+        public uint BytesPerSector;
+        public uint BytesPerCluster;
+        public uint BytesPerFileRecordSegment;
+        public uint ClustersPerFileRecordSegment;
+        public long MftValidDataLength;
+        public long MftStartLcn;
+        public long Mft2StartLcn;
+        public long MftZoneStart;
+        public long MftZoneEnd;
     }
-
+    
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
-
+    public static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+    
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool DeviceIoControl(SafeFileHandle hDevice, uint dwIoControlCode, IntPtr lpInBuffer, uint nInBufferSize, IntPtr lpOutBuffer, uint nOutBufferSize, out uint lpBytesReturned, IntPtr lpOverlapped);
-
+    public static extern bool DeviceIoControl(
+        SafeFileHandle hDevice,
+        uint dwIoControlCode,
+        IntPtr lpInBuffer,
+        uint nInBufferSize,
+        IntPtr lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+    
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool ReadFile(SafeFileHandle hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
-
+    public static extern bool ReadFile(
+        SafeFileHandle hFile,
+        byte[] lpBuffer,
+        uint nNumberOfBytesToRead,
+        out uint lpNumberOfBytesRead,
+        IntPtr lpOverlapped);
+    
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool WriteFile(SafeFileHandle hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
-
+    public static extern bool WriteFile(
+        SafeFileHandle hFile,
+        byte[] lpBuffer,
+        uint nNumberOfBytesToWrite,
+        out uint lpNumberOfBytesWritten,
+        IntPtr lpOverlapped);
+    
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool SetFilePointerEx(SafeFileHandle hFile, long liDistanceToMove, out long lpNewFilePointer, uint dwMoveMethod);
+    public static extern bool SetFilePointerEx(
+        SafeFileHandle hFile,
+        long liDistanceToMove,
+        out long lpNewFilePointer,
+        uint dwMoveMethod);
+    
+    public const uint FILE_BEGIN = 0;
 }
 '@
 
-try { $null = [VirtDiskApi].Name } catch { Add-Type -TypeDefinition $nativeCode -Language CSharp }
+# Use unique type name to avoid conflicts with previously loaded types
+$typeNameCheck = "VirtDiskApi"
+$typesLoaded = $false
+try {
+    $null = [VirtDiskApi].Name
+    $null = [NativeDiskApi].Name
+    $typesLoaded = $true
+}
+catch { }
 
-#endregion
+if (-not $typesLoaded) {
+    Add-Type -TypeDefinition $nativeCodeDefinition -Language CSharp -ErrorAction Stop
+}
 
-#region VHDX Parameters
+# ============================================================
+# PowerShell Function to Create VHDX Parameters Buffer
+# ============================================================
 
-function New-VhdxParamsBuffer([Guid]$UniqueId, [uint64]$MaxSize) {
-    $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal(56)
-    for ($i = 0; $i -lt 56; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($ptr, $i, 0) }
-    [Runtime.InteropServices.Marshal]::WriteInt32($ptr, 0, 1)
-    [Runtime.InteropServices.Marshal]::Copy($UniqueId.ToByteArray(), 0, [IntPtr]::Add($ptr, 4), 16)
-    [Runtime.InteropServices.Marshal]::WriteInt64($ptr, 24, [long]$MaxSize)
-    [Runtime.InteropServices.Marshal]::WriteInt32($ptr, 36, 512)
+function New-CreateVirtualDiskParametersV1 {
+    param(
+        [Parameter(Mandatory)]
+        [Guid]$UniqueId,
+        
+        [Parameter(Mandatory)]
+        [uint64]$MaximumSize,
+        
+        [uint32]$BlockSizeInBytes = 0,
+        
+        [uint32]$SectorSizeInBytes = 512
+    )
+    
+    # CREATE_VIRTUAL_DISK_PARAMETERS Version 1 layout (x64):
+    # Offset 0:  Version (4 bytes) = 1
+    # Offset 4:  UniqueId (16 bytes GUID)
+    # Offset 20: [4 bytes padding to align MaximumSize to 8-byte boundary]
+    # Offset 24: MaximumSize (8 bytes)
+    # Offset 32: BlockSizeInBytes (4 bytes)
+    # Offset 36: SectorSizeInBytes (4 bytes)
+    # Offset 40: ParentPath (8 bytes pointer = IntPtr.Zero)
+    # Offset 48: SourcePath (8 bytes pointer = IntPtr.Zero)
+    # Total: 56 bytes
+    
+    $size = 56
+    $ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($size)
+    
+    # Zero out the entire buffer
+    for ($i = 0; $i -lt $size; $i++) {
+        [System.Runtime.InteropServices.Marshal]::WriteByte($ptr, $i, 0)
+    }
+    
+    # Version = 1 at offset 0
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($ptr, 0, 1)
+    
+    # UniqueId at offset 4
+    $guidBytes = $UniqueId.ToByteArray()
+    [System.Runtime.InteropServices.Marshal]::Copy($guidBytes, 0, [IntPtr]::Add($ptr, 4), 16)
+    
+    # MaximumSize at offset 24
+    [System.Runtime.InteropServices.Marshal]::WriteInt64($ptr, 24, [long]$MaximumSize)
+    
+    # BlockSizeInBytes at offset 32
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($ptr, 32, [int]$BlockSizeInBytes)
+    
+    # SectorSizeInBytes at offset 36
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($ptr, 36, [int]$SectorSizeInBytes)
+    
+    # ParentPath and SourcePath at offsets 40 and 48 are already zero (null pointers)
+    
     return $ptr
 }
 
-#endregion
-
-#region VSS Functions
-
-function New-VssSnapshot([string]$Volume) {
-    if (-not $Volume.EndsWith('\')) { $Volume += '\' }
-    Write-Host "Creating VSS snapshot for $Volume..." -ForegroundColor Cyan
+function Remove-CreateVirtualDiskParameters {
+    param([IntPtr]$Ptr)
     
-    $result = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = $Volume; Context = 'ClientAccessible' }
-    if ($result.ReturnValue -ne 0) { throw "Failed to create shadow copy. Error: $($result.ReturnValue)" }
-    
-    $shadow = Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq $result.ShadowID }
-    if (-not $shadow) { throw "Shadow copy created but could not be retrieved." }
-    
-    return @{ Id = $result.ShadowID; DeviceObject = $shadow.DeviceObject; VolumeName = $Volume }
+    if ($Ptr -ne [IntPtr]::Zero) {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($Ptr)
+    }
 }
 
-function Remove-VssSnapshot([string]$ShadowId) {
+# ============================================================
+# Interactive Menu Functions
+# ============================================================
+
+function Show-Banner {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ║        " -ForegroundColor Cyan -NoNewline
+    Write-Host "BOOTABLE VOLUME CLONE UTILITY" -ForegroundColor Yellow -NoNewline
+    Write-Host "                      ║" -ForegroundColor Cyan
+    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ║   Clone a running Windows volume to a bootable VHDX file    ║" -ForegroundColor Cyan
+    Write-Host "  ║   Supports Hyper-V VMs and Native VHD Boot                  ║" -ForegroundColor Cyan
+    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Get-VolumeList {
+    @(Get-Volume | Where-Object { 
+        $_.DriveLetter -and 
+        $_.DriveType -eq 'Fixed' -and
+        $_.Size -gt 0
+    } | Sort-Object DriveLetter)
+}
+
+function Show-VolumeMenu {
+    param([array]$Volumes)
+    
+    Write-Host "  Available Volumes:" -ForegroundColor White
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host ""
+    
+    $index = 1
+    foreach ($vol in $Volumes) {
+        $sizeGB = [math]::Round($vol.Size / 1GB, 2)
+        $usedGB = [math]::Round(($vol.Size - $vol.SizeRemaining) / 1GB, 2)
+        $usedPct = if ($vol.Size -gt 0) { [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 0) } else { 0 }
+        $label = if ($vol.FileSystemLabel) { $vol.FileSystemLabel } else { "Local Disk" }
+        
+        $barLength = 20
+        $filledLength = [math]::Min($barLength, [math]::Max(0, [math]::Round(($usedPct / 100) * $barLength)))
+        $emptyLength = $barLength - $filledLength
+        
+        $filledBar = if ($filledLength -gt 0) { [string]::new([char]0x2588, $filledLength) } else { "" }
+        $emptyBar = if ($emptyLength -gt 0) { [string]::new([char]0x2591, $emptyLength) } else { "" }
+        $progressBar = "[$filledBar$emptyBar]"
+        
+        Write-Host "    [$index] " -ForegroundColor Yellow -NoNewline
+        Write-Host "$($vol.DriveLetter):" -ForegroundColor White -NoNewline
+        Write-Host " $label" -ForegroundColor Gray
+        Write-Host "        $progressBar " -ForegroundColor DarkCyan -NoNewline
+        Write-Host "$usedGB GB / $sizeGB GB " -ForegroundColor Gray -NoNewline
+        Write-Host "($($vol.FileSystemType))" -ForegroundColor DarkGray
+        Write-Host ""
+        $index++
+    }
+    
+    Write-Host "    [0] " -ForegroundColor Red -NoNewline
+    Write-Host "Exit" -ForegroundColor Gray
+    Write-Host ""
+}
+
+function Read-MenuSelection {
+    param([string]$Prompt, [int]$Min, [int]$Max, [string]$Default = "")
+    
+    while ($true) {
+        if ($Default) {
+            Write-Host "  $Prompt " -ForegroundColor White -NoNewline
+            Write-Host "[$Default]" -ForegroundColor DarkGray -NoNewline
+            Write-Host ": " -ForegroundColor White -NoNewline
+        }
+        else {
+            Write-Host "  ${Prompt}: " -ForegroundColor White -NoNewline
+        }
+        
+        $userInput = Read-Host
+        if ([string]::IsNullOrWhiteSpace($userInput) -and $Default) { $userInput = $Default }
+        
+        $num = 0
+        if ([int]::TryParse($userInput, [ref]$num) -and $num -ge $Min -and $num -le $Max) {
+            return $num
+        }
+        
+        Write-Host "  Please enter a number between $Min and $Max" -ForegroundColor Red
+        Write-Host ""
+    }
+}
+
+function Read-PathInput {
+    param([string]$Prompt, [string]$Default = "", [string]$RequiredExtension = "")
+    
+    while ($true) {
+        if ($Default) {
+            Write-Host "  $Prompt" -ForegroundColor White
+            Write-Host "  [$Default]" -ForegroundColor DarkGray
+            Write-Host "  : " -ForegroundColor White -NoNewline
+        }
+        else {
+            Write-Host "  ${Prompt}: " -ForegroundColor White -NoNewline
+        }
+        
+        $userInput = Read-Host
+        if ([string]::IsNullOrWhiteSpace($userInput) -and $Default) { $userInput = $Default }
+        
+        if ([string]::IsNullOrWhiteSpace($userInput)) {
+            Write-Host "  Path cannot be empty." -ForegroundColor Red
+            Write-Host ""
+            continue
+        }
+        
+        if ($RequiredExtension -and -not $userInput.ToLower().EndsWith($RequiredExtension.ToLower())) {
+            Write-Host "  Path must end with $RequiredExtension" -ForegroundColor Red
+            Write-Host ""
+            continue
+        }
+        
+        return $userInput
+    }
+}
+
+function Read-YesNo {
+    param([string]$Prompt, [bool]$Default = $false)
+    
+    $defaultStr = if ($Default) { "Y/n" } else { "y/N" }
+    Write-Host "  $Prompt " -ForegroundColor White -NoNewline
+    Write-Host "[$defaultStr]" -ForegroundColor DarkGray -NoNewline
+    Write-Host ": " -ForegroundColor White -NoNewline
+    
+    $userInput = Read-Host
+    if ([string]::IsNullOrWhiteSpace($userInput)) { return $Default }
+    return $userInput.Trim().ToLower() -in @('y', 'yes', '1', 'true')
+}
+
+# ============================================================
+# VSS Functions
+# ============================================================
+
+function New-VssSnapshot {
+    param([string]$Volume)
+    
+    if (-not $Volume.EndsWith('\')) { $Volume = $Volume + '\' }
+    
+    Write-Host "Creating VSS snapshot for $Volume..." -ForegroundColor Cyan
+    
+    $result = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{
+        Volume  = $Volume
+        Context = 'ClientAccessible'
+    }
+    
+    if ($result.ReturnValue -ne 0) {
+        $errorMessages = @{
+            1='Access denied'; 2='Invalid argument'; 3='Volume not found'
+            4='Volume not supported'; 5='Unsupported context'; 6='Insufficient storage'
+            7='Volume in use'; 8='Max shadow copies reached'; 9='Operation in progress'
+            10='Provider vetoed'; 11='Provider not registered'; 12='Provider failure'
+        }
+        $msg = $errorMessages[[int]$result.ReturnValue]
+        if (-not $msg) { $msg = "Unknown error" }
+        throw "Failed to create shadow copy. Error $($result.ReturnValue): $msg"
+    }
+    
+    $shadowCopy = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $result.ShadowID }
+    if (-not $shadowCopy) { throw "Shadow copy created but could not be retrieved." }
+    
+    return @{
+        Id           = $result.ShadowID
+        DeviceObject = $shadowCopy.DeviceObject
+        VolumeName   = $Volume
+    }
+}
+
+function Remove-VssSnapshot {
+    param([string]$ShadowId)
+    
     Write-Host "Removing VSS snapshot..." -ForegroundColor Cyan
-    $shadow = Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq $ShadowId }
+    $shadow = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $ShadowId }
     if ($shadow) { Remove-CimInstance -InputObject $shadow -ErrorAction SilentlyContinue }
 }
 
-#endregion
+# ============================================================
+# Virtual Disk Functions
+# ============================================================
 
-#region Virtual Disk Functions
-
-function New-RawVHDX([string]$Path, [uint64]$SizeBytes, [switch]$FixedSize) {
+function New-RawVHDX {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        
+        [Parameter(Mandatory)]
+        [uint64]$SizeBytes,
+        
+        [switch]$FixedSize
+    )
+    
     $typeStr = if ($FixedSize) { "Fixed" } else { "Dynamic" }
     Write-Host "Creating $typeStr VHDX: $Path ($([math]::Round($SizeBytes/1GB, 2)) GB)..." -ForegroundColor Cyan
     
-    $parentDir = Split-Path $Path -Parent
-    if ($parentDir -and -not (Test-Path $parentDir)) { $null = New-Item $parentDir -ItemType Directory -Force }
-    if (Test-Path $Path) { Remove-Item $Path -Force }
+    # Ensure directory exists
+    $parentDir = Split-Path -Path $Path -Parent
+    if ($parentDir -and -not (Test-Path -LiteralPath $parentDir)) {
+        $null = New-Item -Path $parentDir -ItemType Directory -Force
+    }
     
-    # Try Hyper-V cmdlet first
+    # Remove existing file
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Force
+    }
+    
+    # Try using Hyper-V cmdlet first (more reliable)
+    $hyperVAvailable = $false
     try {
-        $null = Get-Command New-VHD -ErrorAction Stop
+        $null = Get-Command -Name New-VHD -ErrorAction Stop
+        $hyperVAvailable = $true
+    }
+    catch { }
+    
+    if ($hyperVAvailable) {
         Write-Host "  Using Hyper-V cmdlet..." -ForegroundColor DarkGray
-        if ($FixedSize) { $null = New-VHD -Path $Path -SizeBytes $SizeBytes -Fixed }
-        else { $null = New-VHD -Path $Path -SizeBytes $SizeBytes -Dynamic }
         
-        $st = New-Object VirtDiskApi+VIRTUAL_STORAGE_TYPE
-        $st.DeviceId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
-        $st.VendorId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
-        $op = New-Object VirtDiskApi+OPEN_VIRTUAL_DISK_PARAMETERS
-        $op.Version = 1
-        $handle = [IntPtr]::Zero
-        $r = [VirtDiskApi]::OpenVirtualDisk([ref]$st, $Path, [VirtDiskApi]::VIRTUAL_DISK_ACCESS_ALL, 0, [ref]$op, [ref]$handle)
-        if ($r -ne 0) { throw "OpenVirtualDisk failed: $r" }
-        return $handle
-    }
-    catch {
-        Write-Host "  Hyper-V unavailable, using VirtDisk API..." -ForegroundColor DarkGray
-        if (Test-Path $Path) { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
+        try {
+            if ($FixedSize) {
+                $null = New-VHD -Path $Path -SizeBytes $SizeBytes -Fixed -ErrorAction Stop
+            }
+            else {
+                $null = New-VHD -Path $Path -SizeBytes $SizeBytes -Dynamic -ErrorAction Stop
+            }
+            
+            # Open with virtdisk API to get a handle
+            $storageType = New-Object -TypeName VirtDiskApi+VIRTUAL_STORAGE_TYPE
+            $storageType.DeviceId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
+            $storageType.VendorId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
+            
+            $openParams = New-Object -TypeName VirtDiskApi+OPEN_VIRTUAL_DISK_PARAMETERS
+            $openParams.Version = 1
+            $openParams.RWDepth = 0
+            
+            $handle = [IntPtr]::Zero
+            $result = [VirtDiskApi]::OpenVirtualDisk(
+                [ref]$storageType,
+                $Path,
+                [VirtDiskApi]::VIRTUAL_DISK_ACCESS_ALL,
+                [VirtDiskApi]::OPEN_VIRTUAL_DISK_FLAG_NONE,
+                [ref]$openParams,
+                [ref]$handle
+            )
+            
+            if ($result -ne 0) {
+                $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+                throw "OpenVirtualDisk failed: $($win32Err.Message)"
+            }
+            
+            return $handle
+        }
+        catch {
+            Write-Host "  Hyper-V method failed: $_" -ForegroundColor Yellow
+            Write-Host "  Trying VirtDisk API..." -ForegroundColor Yellow
+            
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     
+    # Method 2: Manual P/Invoke
+    Write-Host "  Using VirtDisk API..." -ForegroundColor DarkGray
+    
+    # Align size to MB boundary
     $SizeBytes = [uint64]([math]::Ceiling($SizeBytes / 1MB) * 1MB)
-    $st = New-Object VirtDiskApi+VIRTUAL_STORAGE_TYPE
-    $st.DeviceId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
-    $st.VendorId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
     
-    $paramsPtr = New-VhdxParamsBuffer -UniqueId ([Guid]::NewGuid()) -MaxSize $SizeBytes
+    $storageType = New-Object -TypeName VirtDiskApi+VIRTUAL_STORAGE_TYPE
+    $storageType.DeviceId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
+    $storageType.VendorId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
+    
+    # Create parameters using PowerShell function
+    $uniqueId = [Guid]::NewGuid()
+    $paramsPtr = New-CreateVirtualDiskParametersV1 -UniqueId $uniqueId -MaximumSize $SizeBytes -BlockSizeInBytes 0 -SectorSizeInBytes 512
+    
     try {
-        $flags = if ($FixedSize) { [VirtDiskApi]::CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION } else { 0 }
+        $flags = if ($FixedSize) { 
+            [VirtDiskApi]::CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION 
+        } 
+        else { 
+            [VirtDiskApi]::CREATE_VIRTUAL_DISK_FLAG_NONE 
+        }
+        
         $handle = [IntPtr]::Zero
-        $r = [VirtDiskApi]::CreateVirtualDisk([ref]$st, $Path, [VirtDiskApi]::VIRTUAL_DISK_ACCESS_ALL, [IntPtr]::Zero, $flags, 0, $paramsPtr, [IntPtr]::Zero, [ref]$handle)
-        if ($r -ne 0) { throw "CreateVirtualDisk failed: $(New-Object ComponentModel.Win32Exception $r)" }
+        $result = [VirtDiskApi]::CreateVirtualDisk(
+            [ref]$storageType,
+            $Path,
+            [VirtDiskApi]::VIRTUAL_DISK_ACCESS_ALL,
+            [IntPtr]::Zero,
+            $flags,
+            0,
+            $paramsPtr,
+            [IntPtr]::Zero,
+            [ref]$handle
+        )
+        
+        if ($result -ne 0) {
+            $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+            throw "CreateVirtualDisk failed: $($win32Err.Message) (Error: $result)"
+        }
+        
         return $handle
     }
-    finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($paramsPtr) }
-}
-
-function Mount-RawVHDX([IntPtr]$Handle) {
-    Write-Host "Attaching VHDX..." -ForegroundColor Cyan
-    $ap = New-Object VirtDiskApi+ATTACH_VIRTUAL_DISK_PARAMETERS
-    $ap.Version = 1
-    $r = [VirtDiskApi]::AttachVirtualDisk($Handle, [IntPtr]::Zero, [VirtDiskApi]::ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, 0, [ref]$ap, [IntPtr]::Zero)
-    if ($r -ne 0) { throw "AttachVirtualDisk failed: $(New-Object ComponentModel.Win32Exception $r)" }
-    
-    $pathSize = 520
-    $pathBuf = [Runtime.InteropServices.Marshal]::AllocHGlobal($pathSize)
-    try {
-        $r = [VirtDiskApi]::GetVirtualDiskPhysicalPath($Handle, [ref]$pathSize, $pathBuf)
-        if ($r -ne 0) { throw "GetVirtualDiskPhysicalPath failed: $r" }
-        return [Runtime.InteropServices.Marshal]::PtrToStringUni($pathBuf)
+    finally {
+        Remove-CreateVirtualDiskParameters -Ptr $paramsPtr
     }
-    finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($pathBuf) }
 }
 
-function Dismount-RawVHDX([IntPtr]$Handle) {
+function Mount-RawVHDX {
+    param([IntPtr]$Handle, [switch]$WithDriveLetter)
+    
+    Write-Host "Attaching VHDX..." -ForegroundColor Cyan
+    
+    $attachParams = New-Object -TypeName VirtDiskApi+ATTACH_VIRTUAL_DISK_PARAMETERS
+    $attachParams.Version = 1
+    
+    $flags = if ($WithDriveLetter) { [VirtDiskApi]::ATTACH_VIRTUAL_DISK_FLAG_NONE } 
+             else { [VirtDiskApi]::ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER }
+    
+    $result = [VirtDiskApi]::AttachVirtualDisk($Handle, [IntPtr]::Zero, $flags, 0, [ref]$attachParams, [IntPtr]::Zero)
+    
+    if ($result -ne 0) {
+        $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+        throw "AttachVirtualDisk failed: $($win32Err.Message)"
+    }
+    
+    $pathSizeBytes = 520
+    $pathBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($pathSizeBytes)
+    
+    try {
+        $result = [VirtDiskApi]::GetVirtualDiskPhysicalPath($Handle, [ref]$pathSizeBytes, $pathBuffer)
+        if ($result -ne 0) {
+            $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+            throw "GetVirtualDiskPhysicalPath failed: $($win32Err.Message)"
+        }
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringUni($pathBuffer)
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pathBuffer)
+    }
+}
+
+function Dismount-RawVHDX {
+    param([IntPtr]$Handle)
+    
     if ($Handle -eq [IntPtr]::Zero) { return }
+    
     Write-Host "Detaching VHDX..." -ForegroundColor Cyan
     $null = [VirtDiskApi]::DetachVirtualDisk($Handle, 0, 0)
     $null = [VirtDiskApi]::CloseHandle($Handle)
 }
 
-#endregion
+# ============================================================
+# Disk Initialization and Partitioning
+# ============================================================
 
-#region Disk Initialization
-
-function Initialize-BootableVHDX([string]$PhysicalPath, [string]$BootMode) {
-    Write-Host "Initializing disk for $BootMode boot..." -ForegroundColor Cyan
+function Initialize-BootableVHDX {
+    param(
+        [string]$PhysicalPath,
+        [ValidateSet('UEFI', 'BIOS')][string]$BootMode,
+        [uint64]$WindowsPartitionSize
+    )
     
-    if ($PhysicalPath -match 'PhysicalDrive(\d+)') { $diskNum = [int]$Matches[1] }
-    else { throw "Could not parse disk number from: $PhysicalPath" }
+    Write-Host "Initializing disk structure for $BootMode boot..." -ForegroundColor Cyan
     
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 500
-        $disk = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
-        if ($disk) { break }
-    }
-    if (-not $disk) { throw "Disk $diskNum not found" }
-    
-    Write-Host "  Disk $diskNum: $([math]::Round($disk.Size/1GB,2)) GB" -ForegroundColor DarkGray
-    
-    if ($BootMode -eq 'UEFI') {
-        Initialize-Disk -Number $diskNum -PartitionStyle GPT
-        Start-Sleep -Seconds 2
-        
-        Write-Host "  Creating EFI partition (260MB)..." -ForegroundColor DarkGray
-        $esp = New-Partition -DiskNumber $diskNum -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-        $null = Format-Volume -Partition $esp -FileSystem FAT32 -NewFileSystemLabel "System" -Confirm:$false
-        
-        Write-Host "  Creating MSR partition (16MB)..." -ForegroundColor DarkGray
-        $null = New-Partition -DiskNumber $diskNum -Size 16MB -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
-        
-        Write-Host "  Creating Windows partition..." -ForegroundColor DarkGray
-        $win = New-Partition -DiskNumber $diskNum -UseMaximumSize -GptType '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
-        
-        return @{ DiskNumber = $diskNum; EspPartition = $esp; WindowsPartition = $win; BootMode = 'UEFI' }
+    if ($PhysicalPath -match 'PhysicalDrive(\d+)') {
+        $diskNumber = [int]$Matches[1]
     }
     else {
-        Initialize-Disk -Number $diskNum -PartitionStyle MBR
+        throw "Could not determine disk number from path: $PhysicalPath"
+    }
+    
+    # Wait for disk
+    $retries = 20
+    $disk = $null
+    while ($retries -gt 0 -and -not $disk) {
+        Start-Sleep -Milliseconds 500
+        $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
+        $retries--
+    }
+    
+    if (-not $disk) { throw "Could not find disk $diskNumber" }
+    
+    Write-Host "  Disk $diskNumber found: $([math]::Round($disk.Size/1GB, 2)) GB" -ForegroundColor DarkGray
+    
+    if ($BootMode -eq 'UEFI') {
+        Write-Host "  Initializing as GPT..." -ForegroundColor DarkGray
+        Initialize-Disk -Number $diskNumber -PartitionStyle GPT -ErrorAction Stop
         Start-Sleep -Seconds 2
         
-        Write-Host "  Creating System partition (500MB)..." -ForegroundColor DarkGray
-        $sys = New-Partition -DiskNumber $diskNum -Size 500MB -IsActive
-        $null = Format-Volume -Partition $sys -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false
+        Write-Host "  Creating EFI System Partition (260 MB)..." -ForegroundColor DarkGray
+        $espPartition = New-Partition -DiskNumber $diskNumber -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+        Format-Volume -Partition $espPartition -FileSystem FAT32 -NewFileSystemLabel "System" -Confirm:$false | Out-Null
+        
+        Write-Host "  Creating Microsoft Reserved Partition (16 MB)..." -ForegroundColor DarkGray
+        $null = New-Partition -DiskNumber $diskNumber -Size 16MB -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
         
         Write-Host "  Creating Windows partition..." -ForegroundColor DarkGray
-        $win = New-Partition -DiskNumber $diskNum -UseMaximumSize
+        $winPartition = New-Partition -DiskNumber $diskNumber -UseMaximumSize -GptType '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
         
-        return @{ DiskNumber = $diskNum; SystemPartition = $sys; WindowsPartition = $win; BootMode = 'BIOS' }
+        return @{ DiskNumber = $diskNumber; EspPartition = $espPartition; WindowsPartition = $winPartition; BootMode = 'UEFI' }
+    }
+    else {
+        Write-Host "  Initializing as MBR..." -ForegroundColor DarkGray
+        Initialize-Disk -Number $diskNumber -PartitionStyle MBR -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        
+        Write-Host "  Creating System Reserved partition (500 MB)..." -ForegroundColor DarkGray
+        $sysPartition = New-Partition -DiskNumber $diskNumber -Size 500MB -IsActive
+        Format-Volume -Partition $sysPartition -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false | Out-Null
+        
+        Write-Host "  Creating Windows partition..." -ForegroundColor DarkGray
+        $winPartition = New-Partition -DiskNumber $diskNumber -UseMaximumSize
+        
+        return @{ DiskNumber = $diskNumber; SystemPartition = $sysPartition; WindowsPartition = $winPartition; BootMode = 'BIOS' }
     }
 }
 
-function Install-BootFiles([hashtable]$DiskInfo, [string]$WinLetter) {
+function Install-BootFiles {
+    param([hashtable]$DiskInfo, [string]$WindowsDriveLetter)
+    
     Write-Host "Installing boot files..." -ForegroundColor Cyan
     
-    $winPath = "${WinLetter}:\Windows"
-    if (-not (Test-Path $winPath)) { throw "Windows not found at $winPath" }
-    
-    $bootLetter = Get-AvailableDriveLetter
-    if (-not $bootLetter) { throw "No available drive letters" }
-    
-    $bootPartition = if ($DiskInfo.BootMode -eq 'UEFI') { $DiskInfo.EspPartition } else { $DiskInfo.SystemPartition }
-    $firmware = if ($DiskInfo.BootMode -eq 'UEFI') { 'UEFI' } else { 'BIOS' }
-    
-    Write-Host "  Assigning $bootLetter to boot partition..." -ForegroundColor DarkGray
-    $bootPartition | Set-Partition -NewDriveLetter $bootLetter
-    Start-Sleep -Seconds 2
-    
-    try {
-        Write-Host "  Running bcdboot /f $firmware..." -ForegroundColor DarkGray
-        $output = & bcdboot.exe "$winPath" /s "${bootLetter}:" /f $firmware 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "bcdboot failed: $output" }
-        Write-Host "  Boot files installed" -ForegroundColor Green
+    $windowsPath = "${WindowsDriveLetter}:\Windows"
+    if (-not (Test-Path -LiteralPath $windowsPath)) {
+        throw "Windows directory not found at $windowsPath"
     }
-    finally {
-        try { $bootPartition | Remove-PartitionAccessPath -AccessPath "${bootLetter}:\" -ErrorAction SilentlyContinue } catch { }
+    
+    if ($DiskInfo.BootMode -eq 'UEFI') {
+        $availableLetters = @([char[]]('S'..'Z') | Where-Object { -not (Test-Path -LiteralPath "$($_):") })
+        if ((Get-SafeCount $availableLetters) -eq 0) { throw "No available drive letters for ESP" }
+        
+        $espLetter = $availableLetters[0]
+        Write-Host "  Assigning drive letter $espLetter to ESP..." -ForegroundColor DarkGray
+        $DiskInfo.EspPartition | Set-Partition -NewDriveLetter $espLetter
+        Start-Sleep -Seconds 2
+        
+        try {
+            Write-Host "  Running bcdboot for UEFI..." -ForegroundColor DarkGray
+            $bcdbootOutput = & bcdboot.exe "$windowsPath" /s "${espLetter}:" /f UEFI 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "bcdboot failed: $bcdbootOutput"
+            }
+            Write-Host "  Boot files installed successfully" -ForegroundColor Green
+        }
+        finally {
+            try { $DiskInfo.EspPartition | Remove-PartitionAccessPath -AccessPath "${espLetter}:\" -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    else {
+        $availableLetters = @([char[]]('S'..'Z') | Where-Object { -not (Test-Path -LiteralPath "$($_):") })
+        if ((Get-SafeCount $availableLetters) -eq 0) { throw "No available drive letters for System partition" }
+        
+        $sysLetter = $availableLetters[0]
+        Write-Host "  Assigning drive letter $sysLetter to System partition..." -ForegroundColor DarkGray
+        $DiskInfo.SystemPartition | Set-Partition -NewDriveLetter $sysLetter
+        Start-Sleep -Seconds 2
+        
+        try {
+            Write-Host "  Running bcdboot for BIOS..." -ForegroundColor DarkGray
+            $bcdbootOutput = & bcdboot.exe "$windowsPath" /s "${sysLetter}:" /f BIOS 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "bcdboot failed: $bcdbootOutput"
+            }
+            Write-Host "  Boot files installed successfully" -ForegroundColor Green
+        }
+        finally {
+            try { $DiskInfo.SystemPartition | Remove-PartitionAccessPath -AccessPath "${sysLetter}:\" -ErrorAction SilentlyContinue } catch { }
+        }
     }
 }
 
-#endregion
+# ============================================================
+# Volume Bitmap Functions
+# ============================================================
 
-#region NTFS Bitmap Functions
-
-function Get-NtfsVolumeData([string]$DriveLetter) {
+function Get-NtfsVolumeData {
+    param([string]$DriveLetter)
+    
     $DriveLetter = $DriveLetter.TrimEnd(':', '\')
-    $handle = [NativeDiskApi]::CreateFile("\\.\${DriveLetter}:", [NativeDiskApi]::GENERIC_READ, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
-    if ($handle.IsInvalid) { throw "Failed to open volume" }
+    $volumePath = '\\.\' + $DriveLetter + ':'
+    
+    $handle = [NativeDiskApi]::CreateFile($volumePath, [NativeDiskApi]::GENERIC_READ, 
+        ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+        [IntPtr]::Zero, [NativeDiskApi]::OPEN_EXISTING, 0, [IntPtr]::Zero)
+    
+    if ($handle.IsInvalid) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open volume: $(New-Object System.ComponentModel.Win32Exception $err)"
+    }
     
     try {
-        $bufSize = [Runtime.InteropServices.Marshal]::SizeOf([type][NativeDiskApi+NTFS_VOLUME_DATA_BUFFER])
-        $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal($bufSize)
+        $bufferSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][NativeDiskApi+NTFS_VOLUME_DATA_BUFFER])
+        $buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bufferSize)
+        
         try {
-            $ret = [uint32]0
-            if (-not [NativeDiskApi]::DeviceIoControl($handle, [NativeDiskApi]::FSCTL_GET_NTFS_VOLUME_DATA, [IntPtr]::Zero, 0, $buf, $bufSize, [ref]$ret, [IntPtr]::Zero)) {
-                throw "FSCTL_GET_NTFS_VOLUME_DATA failed"
+            $bytesReturned = [uint32]0
+            $success = [NativeDiskApi]::DeviceIoControl($handle, [NativeDiskApi]::FSCTL_GET_NTFS_VOLUME_DATA,
+                [IntPtr]::Zero, 0, $buffer, [uint32]$bufferSize, [ref]$bytesReturned, [IntPtr]::Zero)
+            
+            if (-not $success) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "FSCTL_GET_NTFS_VOLUME_DATA failed: $(New-Object System.ComponentModel.Win32Exception $err)"
             }
-            $data = [Runtime.InteropServices.Marshal]::PtrToStructure($buf, [type][NativeDiskApi+NTFS_VOLUME_DATA_BUFFER])
-            return @{ TotalClusters = $data.TotalClusters; FreeClusters = $data.FreeClusters; BytesPerCluster = $data.BytesPerCluster; BytesPerSector = $data.BytesPerSector }
+            
+            $volumeData = [System.Runtime.InteropServices.Marshal]::PtrToStructure($buffer, [type][NativeDiskApi+NTFS_VOLUME_DATA_BUFFER])
+            
+            return @{
+                TotalClusters   = $volumeData.TotalClusters
+                FreeClusters    = $volumeData.FreeClusters
+                BytesPerCluster = $volumeData.BytesPerCluster
+                BytesPerSector  = $volumeData.BytesPerSector
+            }
         }
-        finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buf) }
+        finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) }
     }
     finally { $handle.Close() }
 }
 
-function Get-VolumeBitmap([string]$DriveLetter, [long]$TotalClusters) {
-    Write-Host "Reading allocation bitmap..." -ForegroundColor Cyan
+function Get-VolumeBitmap {
+    param([string]$DriveLetter, [long]$TotalClusters)
+    
+    Write-Host "Reading volume allocation bitmap..." -ForegroundColor Cyan
+    
     $DriveLetter = $DriveLetter.TrimEnd(':', '\')
-    $handle = [NativeDiskApi]::CreateFile("\\.\${DriveLetter}:", [NativeDiskApi]::GENERIC_READ, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+    $volumePath = '\\.\' + $DriveLetter + ':'
+    
+    $handle = [NativeDiskApi]::CreateFile($volumePath, [NativeDiskApi]::GENERIC_READ,
+        ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+        [IntPtr]::Zero, [NativeDiskApi]::OPEN_EXISTING, 0, [IntPtr]::Zero)
+    
     if ($handle.IsInvalid) { throw "Failed to open volume" }
     
     try {
         $bitmapBytes = [long][math]::Ceiling($TotalClusters / 8.0)
-        $bitmap = New-Object byte[] $bitmapBytes
-        $lcn = [long]0
+        $fullBitmap = New-Object byte[] $bitmapBytes
+        
+        $startingLcn = [long]0
+        $headerSize = 16
         $chunkSize = 1048576
-        $outBuf = [Runtime.InteropServices.Marshal]::AllocHGlobal($chunkSize)
-        $inBuf = [Runtime.InteropServices.Marshal]::AllocHGlobal(8)
-        $offset = 0
+        $outputBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($chunkSize)
+        $inputBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(8)
+        $bitmapOffset = 0
         
         try {
-            while ($lcn -lt $TotalClusters) {
-                [Runtime.InteropServices.Marshal]::WriteInt64($inBuf, 0, $lcn)
-                $ret = [uint32]0
-                $null = [NativeDiskApi]::DeviceIoControl($handle, [NativeDiskApi]::FSCTL_GET_VOLUME_BITMAP, $inBuf, 8, $outBuf, $chunkSize, [ref]$ret, [IntPtr]::Zero)
+            while ($startingLcn -lt $TotalClusters) {
+                [System.Runtime.InteropServices.Marshal]::WriteInt64($inputBuffer, 0, $startingLcn)
                 
-                $dataBytes = [int]($ret - 16)
+                $bytesReturned = [uint32]0
+                $success = [NativeDiskApi]::DeviceIoControl($handle, [NativeDiskApi]::FSCTL_GET_VOLUME_BITMAP,
+                    $inputBuffer, 8, $outputBuffer, [uint32]$chunkSize, [ref]$bytesReturned, [IntPtr]::Zero)
+                
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    if ($err -ne 234) { throw "FSCTL_GET_VOLUME_BITMAP failed: error $err" }
+                }
+                
+                $dataBytes = [int]($bytesReturned - $headerSize)
                 if ($dataBytes -gt 0) {
-                    $copyLen = [math]::Min($dataBytes, $bitmap.Length - $offset)
+                    $copyLen = [math]::Min($dataBytes, $fullBitmap.Length - $bitmapOffset)
                     if ($copyLen -gt 0) {
-                        [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($outBuf, 16), $bitmap, $offset, $copyLen)
-                        $offset += $copyLen
+                        [System.Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($outputBuffer, $headerSize), $fullBitmap, $bitmapOffset, $copyLen)
+                        $bitmapOffset += $copyLen
                     }
                 }
                 
-                $read = [long]$dataBytes * 8
-                if ($read -le 0) { break }
-                $lcn += $read
+                $clustersRead = [long]$dataBytes * 8
+                if ($clustersRead -le 0) { break }
+                $startingLcn += $clustersRead
                 
-                Write-Progress -Activity "Reading Bitmap" -PercentComplete (Get-ClampedPercent $lcn $TotalClusters)
+                $pct = [math]::Min(100, [int](($startingLcn / $TotalClusters) * 100))
+                Write-Progress -Activity "Reading Bitmap" -Status "$pct%" -PercentComplete $pct
             }
             Write-Progress -Activity "Reading Bitmap" -Completed
         }
         finally {
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($outBuf)
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($inBuf)
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($outputBuffer)
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($inputBuffer)
         }
-        return $bitmap
+        
+        return $fullBitmap
     }
     finally { $handle.Close() }
 }
 
-function Get-AllocatedRanges([byte[]]$Bitmap, [long]$TotalClusters, [uint32]$BytesPerCluster) {
-    Write-Host "Analyzing bitmap..." -ForegroundColor Cyan
-    $ranges = [Collections.ArrayList]::new()
-    $start = [long]-1
-    $allocated = [long]0
-    $interval = [math]::Max(1, [int]($TotalClusters / 100))
+function Get-AllocatedRanges {
+    param([byte[]]$Bitmap, [long]$TotalClusters, [uint32]$BytesPerCluster, [int]$MinRunClusters = 256)
     
-    for ($c = [long]0; $c -lt $TotalClusters; $c++) {
-        $isAlloc = ($Bitmap[[int][math]::Floor($c / 8)] -band (1 -shl ($c % 8))) -ne 0
-        if ($isAlloc) {
-            if ($start -eq -1) { $start = $c }
-            $allocated++
-        }
-        elseif ($start -ne -1) {
-            $null = $ranges.Add([PSCustomObject]@{ Start = $start; End = $c - 1; Count = $c - $start })
-            $start = -1
-        }
-        if ($c % $interval -eq 0) { Write-Progress -Activity "Analyzing" -PercentComplete (Get-ClampedPercent $c $TotalClusters) }
-    }
-    if ($start -ne -1) { $null = $ranges.Add([PSCustomObject]@{ Start = $start; End = $TotalClusters - 1; Count = $TotalClusters - $start }) }
-    Write-Progress -Activity "Analyzing" -Completed
+    Write-Host "Analyzing allocation bitmap..." -ForegroundColor Cyan
     
-    # Merge nearby ranges
-    Write-Host "Merging ranges..." -ForegroundColor Cyan
-    $merged = [Collections.ArrayList]::new()
-    $prev = $null
-    foreach ($r in $ranges) {
-        if ($null -eq $prev) { $prev = $r; continue }
-        if (($r.Start - $prev.End - 1) -le 256) {
-            $prev = [PSCustomObject]@{ Start = $prev.Start; End = $r.End; Count = $r.End - $prev.Start + 1 }
+    $ranges = New-Object System.Collections.ArrayList
+    $currentStart = [long]-1
+    $allocatedClusters = [long]0
+    $progressInterval = [math]::Max(1, [int]($TotalClusters / 100))
+    
+    for ($cluster = [long]0; $cluster -lt $TotalClusters; $cluster++) {
+        $byteIndex = [int][math]::Floor($cluster / 8)
+        $bitIndex = [int]($cluster % 8)
+        $isAllocated = ($Bitmap[$byteIndex] -band (1 -shl $bitIndex)) -ne 0
+        
+        if ($isAllocated) {
+            if ($currentStart -eq -1) { $currentStart = $cluster }
+            $allocatedClusters++
         }
         else {
-            $null = $merged.Add($prev)
-            $prev = $r
+            if ($currentStart -ne -1) {
+                $null = $ranges.Add([PSCustomObject]@{ StartCluster = $currentStart; EndCluster = $cluster - 1; ClusterCount = $cluster - $currentStart })
+                $currentStart = -1
+            }
+        }
+        
+        if ($cluster % $progressInterval -eq 0) {
+            Write-Progress -Activity "Analyzing Bitmap" -Status "$([int](($cluster / $TotalClusters) * 100))%" -PercentComplete ([int](($cluster / $TotalClusters) * 100))
         }
     }
-    if ($prev) { $null = $merged.Add($prev) }
     
-    $allocBytes = [long]$allocated * $BytesPerCluster
-    Write-Host "  Allocated: $([math]::Round($allocBytes/1GB,2)) GB in $($merged.Count) ranges" -ForegroundColor DarkGray
-    return @{ Ranges = $merged; AllocatedBytes = $allocBytes }
+    if ($currentStart -ne -1) {
+        $null = $ranges.Add([PSCustomObject]@{ StartCluster = $currentStart; EndCluster = $TotalClusters - 1; ClusterCount = $TotalClusters - $currentStart })
+    }
+    Write-Progress -Activity "Analyzing Bitmap" -Completed
+    
+    Write-Host "Merging adjacent ranges..." -ForegroundColor Cyan
+    $mergedRanges = New-Object System.Collections.ArrayList
+    $prev = $null
+    
+    foreach ($range in $ranges) {
+        if ($null -eq $prev) { $prev = $range; continue }
+        $gap = $range.StartCluster - $prev.EndCluster - 1
+        if ($gap -le $MinRunClusters) {
+            $prev = [PSCustomObject]@{ StartCluster = $prev.StartCluster; EndCluster = $range.EndCluster; ClusterCount = $range.EndCluster - $prev.StartCluster + 1 }
+        }
+        else {
+            $null = $mergedRanges.Add($prev)
+            $prev = $range
+        }
+    }
+    if ($prev) { $null = $mergedRanges.Add($prev) }
+    
+    $totalBytes = [long]$TotalClusters * $BytesPerCluster
+    $allocatedBytes = [long]$allocatedClusters * $BytesPerCluster
+    Write-Host "  Allocated: $([math]::Round($allocatedBytes/1GB, 2)) GB of $([math]::Round($totalBytes/1GB, 2)) GB" -ForegroundColor DarkGray
+    
+    return @{ Ranges = $mergedRanges; AllocatedClusters = $allocatedClusters; AllocatedBytes = $allocatedBytes }
 }
 
-#endregion
+# ============================================================
+# Raw Disk I/O
+# ============================================================
 
-#region Raw I/O
-
-function Open-RawDisk([string]$Path, [string]$Access) {
-    $flags = switch ($Access) {
+function Open-RawDisk {
+    param([string]$Path, [ValidateSet('Read', 'Write', 'ReadWrite')][string]$Access)
+    
+    $accessFlags = switch ($Access) {
         'Read' { [NativeDiskApi]::GENERIC_READ }
         'Write' { [NativeDiskApi]::GENERIC_WRITE }
-        default { [NativeDiskApi]::GENERIC_READ -bor [NativeDiskApi]::GENERIC_WRITE }
+        'ReadWrite' { [NativeDiskApi]::GENERIC_READ -bor [NativeDiskApi]::GENERIC_WRITE }
     }
-    $handle = [NativeDiskApi]::CreateFile($Path, $flags, 3, [IntPtr]::Zero, 3, ([NativeDiskApi]::FILE_FLAG_NO_BUFFERING -bor [NativeDiskApi]::FILE_FLAG_WRITE_THROUGH), [IntPtr]::Zero)
-    if ($handle.IsInvalid) { throw "Failed to open $Path" }
+    
+    $handle = [NativeDiskApi]::CreateFile($Path, $accessFlags,
+        ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+        [IntPtr]::Zero, [NativeDiskApi]::OPEN_EXISTING,
+        ([NativeDiskApi]::FILE_FLAG_NO_BUFFERING -bor [NativeDiskApi]::FILE_FLAG_WRITE_THROUGH),
+        [IntPtr]::Zero)
+    
+    if ($handle.IsInvalid) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open $Path : $(New-Object System.ComponentModel.Win32Exception $err)"
+    }
+    
     return $handle
 }
 
-function Copy-DataToPartition([string]$Source, [string]$DiskPath, [long]$Offset, [uint64]$Total, [int]$BlockSize) {
-    Write-Host "Copying $([math]::Round($Total/1GB,2)) GB..." -ForegroundColor Cyan
-    $srcH = Open-RawDisk $Source 'Read'
-    $dstH = Open-RawDisk $DiskPath 'Write'
+# ============================================================
+# Block Copy Functions
+# ============================================================
+
+function Copy-VolumeToPartition {
+    param([string]$SourcePath, [string]$DiskPath, [long]$PartitionOffset, [uint64]$TotalBytes, [int]$BlockSize = 4194304)
+    
+    Write-Host "Copying $([math]::Round($TotalBytes/1GB, 2)) GB to partition..." -ForegroundColor Cyan
+    
+    $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
+    $destHandle = Open-RawDisk -Path $DiskPath -Access Write
     
     try {
-        $buf = New-Object byte[] $BlockSize
-        $copied = [uint64]0
-        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $buffer = New-Object byte[] $BlockSize
+        $totalCopied = [uint64]0
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $lastPct = -1
         
-        while ($copied -lt $Total) {
-            $remaining = $Total - $copied
-            $toRead = [math]::Min([uint64]$BlockSize, $remaining)
-            $aligned = [uint32]([math]::Ceiling($toRead / 4096) * 4096)
+        while ($totalCopied -lt $TotalBytes) {
+            $alignedBytes = [uint32]([math]::Ceiling([Math]::Min($BlockSize, $TotalBytes - $totalCopied) / 4096) * 4096)
             
-            $read = [uint32]0
-            if (-not [NativeDiskApi]::ReadFile($srcH, $buf, $aligned, [ref]$read, [IntPtr]::Zero)) { throw "Read failed at $copied" }
-            if ($read -eq 0) { break }
+            $bytesRead = [uint32]0
+            if (-not [NativeDiskApi]::ReadFile($sourceHandle, $buffer, $alignedBytes, [ref]$bytesRead, [IntPtr]::Zero)) {
+                throw "Read failed at offset $totalCopied"
+            }
+            if ($bytesRead -eq 0) { break }
             
-            $pos = [long]0
-            if (-not [NativeDiskApi]::SetFilePointerEx($dstH, ($Offset + $copied), [ref]$pos, 0)) { throw "Seek failed" }
+            $destOffset = $PartitionOffset + $totalCopied
+            $newPos = [long]0
+            if (-not [NativeDiskApi]::SetFilePointerEx($destHandle, $destOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN)) {
+                throw "Seek failed"
+            }
             
-            $toWrite = [math]::Min($read, $remaining)
-            $alignedW = [uint32]([math]::Ceiling($toWrite / 4096) * 4096)
-            $written = [uint32]0
-            if (-not [NativeDiskApi]::WriteFile($dstH, $buf, $alignedW, [ref]$written, [IntPtr]::Zero)) { throw "Write failed" }
+            $bytesWritten = [uint32]0
+            if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
+                throw "Write failed"
+            }
             
-            $copied += $toWrite
-            $pct = Get-ClampedPercent $copied $Total
+            $totalCopied += $bytesRead
+            $pct = [math]::Floor(($totalCopied / $TotalBytes) * 100)
             if ($pct -gt $lastPct) {
-                $speed = if ($sw.Elapsed.TotalSeconds -gt 0) { $copied / $sw.Elapsed.TotalSeconds / 1MB } else { 0 }
+                $speed = if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB } else { 0 }
                 Write-Progress -Activity "Copying" -Status "$pct% - $([math]::Round($speed,1)) MB/s" -PercentComplete $pct
                 $lastPct = $pct
             }
         }
-        $sw.Stop()
+        
+        $stopwatch.Stop()
         Write-Progress -Activity "Copying" -Completed
-        $avgSpeed = if ($sw.Elapsed.TotalSeconds -gt 0) { $copied / $sw.Elapsed.TotalSeconds / 1MB } else { 0 }
-        Write-Host "Copied $([math]::Round($copied/1GB,2)) GB in $([math]::Round($sw.Elapsed.TotalMinutes,1)) min ($([math]::Round($avgSpeed,1)) MB/s)" -ForegroundColor Green
+        $avgSpeed = if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB } else { 0 }
+        Write-Host "Copied $([math]::Round($totalCopied/1GB, 2)) GB in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) min ($([math]::Round($avgSpeed, 1)) MB/s)" -ForegroundColor Green
     }
     finally {
-        if ($srcH -and -not $srcH.IsClosed) { $srcH.Close() }
-        if ($dstH -and -not $dstH.IsClosed) { $dstH.Close() }
+        if (-not $sourceHandle.IsClosed) { $sourceHandle.Close() }
+        if (-not $destHandle.IsClosed) { $destHandle.Close() }
     }
 }
 
-function Copy-AllocatedData([string]$Source, [string]$DiskPath, [long]$Offset, $Ranges, [uint32]$ClusterSize, [long]$AllocBytes, [int]$BlockSize) {
-    if ($BlockSize % $ClusterSize -ne 0) { $BlockSize = [int]([math]::Ceiling($BlockSize / $ClusterSize) * $ClusterSize) }
-    $clustersPerBlock = [long]($BlockSize / $ClusterSize)
+function Copy-AllocatedBlocksToPartition {
+    param([string]$SourcePath, [string]$DiskPath, [long]$PartitionOffset, [System.Collections.ArrayList]$Ranges, [uint32]$BytesPerCluster, [long]$AllocatedBytes, [int]$BlockSize = 4194304)
     
-    Write-Host "Copying $([math]::Round($AllocBytes/1GB,2)) GB allocated data..." -ForegroundColor Cyan
-    $srcH = Open-RawDisk $Source 'Read'
-    $dstH = Open-RawDisk $DiskPath 'Write'
+    if ($BlockSize % $BytesPerCluster -ne 0) {
+        $BlockSize = [int]([math]::Ceiling($BlockSize / $BytesPerCluster) * $BytesPerCluster)
+    }
+    $clustersPerBlock = [long]($BlockSize / $BytesPerCluster)
+    
+    Write-Host "Copying $([math]::Round($AllocatedBytes/1GB, 2)) GB of allocated data..." -ForegroundColor Cyan
+    
+    $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
+    $destHandle = Open-RawDisk -Path $DiskPath -Access Write
     
     try {
-        $buf = New-Object byte[] $BlockSize
-        $copied = [long]0
-        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $buffer = New-Object byte[] $BlockSize
+        $totalCopied = [long]0
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $lastPct = -1
         
-        foreach ($r in $Ranges) {
-            $cluster = [long]$r.Start
-            $remaining = [long]$r.Count
+        foreach ($range in $Ranges) {
+            $clusterOffset = [long]$range.StartCluster
+            $clustersRemaining = [long]$range.ClusterCount
             
-            while ($remaining -gt 0) {
-                $toRead = [math]::Min($clustersPerBlock, $remaining)
-                $bytes = [uint32]($toRead * $ClusterSize)
-                $srcOffset = [long]$cluster * $ClusterSize
+            while ($clustersRemaining -gt 0) {
+                $clustersToRead = [math]::Min($clustersPerBlock, $clustersRemaining)
+                $bytesToRead = [uint32]($clustersToRead * $BytesPerCluster)
+                $sourceByteOffset = [long]$clusterOffset * $BytesPerCluster
                 
-                $pos = [long]0
-                $null = [NativeDiskApi]::SetFilePointerEx($srcH, $srcOffset, [ref]$pos, 0)
+                $newPos = [long]0
+                [NativeDiskApi]::SetFilePointerEx($sourceHandle, $sourceByteOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN) | Out-Null
                 
-                $read = [uint32]0
-                if (-not [NativeDiskApi]::ReadFile($srcH, $buf, $bytes, [ref]$read, [IntPtr]::Zero)) { throw "Read failed" }
+                $bytesRead = [uint32]0
+                if (-not [NativeDiskApi]::ReadFile($sourceHandle, $buffer, $bytesToRead, [ref]$bytesRead, [IntPtr]::Zero)) {
+                    throw "Read failed"
+                }
                 
-                $null = [NativeDiskApi]::SetFilePointerEx($dstH, ($Offset + $srcOffset), [ref]$pos, 0)
+                $destByteOffset = $PartitionOffset + $sourceByteOffset
+                [NativeDiskApi]::SetFilePointerEx($destHandle, $destByteOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN) | Out-Null
                 
-                $written = [uint32]0
-                if (-not [NativeDiskApi]::WriteFile($dstH, $buf, $read, [ref]$written, [IntPtr]::Zero)) { throw "Write failed" }
+                $bytesWritten = [uint32]0
+                if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
+                    throw "Write failed"
+                }
                 
-                $copied += $read
-                $cluster += $toRead
-                $remaining -= $toRead
+                $totalCopied += $bytesRead
+                $clusterOffset += $clustersToRead
+                $clustersRemaining -= $clustersToRead
                 
-                $pct = Get-ClampedPercent $copied $AllocBytes
+                $pct = [math]::Floor(($totalCopied / $AllocatedBytes) * 100)
                 if ($pct -gt $lastPct) {
-                    $speed = if ($sw.Elapsed.TotalSeconds -gt 0) { $copied / $sw.Elapsed.TotalSeconds / 1MB } else { 0 }
+                    $speed = if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB } else { 0 }
                     Write-Progress -Activity "Copying" -Status "$pct% - $([math]::Round($speed,1)) MB/s" -PercentComplete $pct
                     $lastPct = $pct
                 }
             }
         }
-        $sw.Stop()
+        
+        $stopwatch.Stop()
         Write-Progress -Activity "Copying" -Completed
-        $avgSpeed = if ($sw.Elapsed.TotalSeconds -gt 0) { $copied / $sw.Elapsed.TotalSeconds / 1MB } else { 0 }
-        Write-Host "Copied $([math]::Round($copied/1GB,2)) GB in $([math]::Round($sw.Elapsed.TotalMinutes,1)) min ($([math]::Round($avgSpeed,1)) MB/s)" -ForegroundColor Green
+        $avgSpeed = if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB } else { 0 }
+        Write-Host "Copied $([math]::Round($totalCopied/1GB, 2)) GB in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) min ($([math]::Round($avgSpeed, 1)) MB/s)" -ForegroundColor Green
     }
     finally {
-        if ($srcH -and -not $srcH.IsClosed) { $srcH.Close() }
-        if ($dstH -and -not $dstH.IsClosed) { $dstH.Close() }
+        if (-not $sourceHandle.IsClosed) { $sourceHandle.Close() }
+        if (-not $destHandle.IsClosed) { $destHandle.Close() }
     }
 }
 
-#endregion
-
-#region Main Clone Function
+# ============================================================
+# Main Clone Function
+# ============================================================
 
 function New-BootableVolumeClone {
+    [CmdletBinding()]
     param(
-        [string]$SourceVolume,
-        [string]$DestinationVHDX,
-        [string]$BootMode = 'UEFI',
+        [Parameter(Mandatory)][string]$SourceVolume,
+        [Parameter(Mandatory)][string]$DestinationVHDX,
+        [ValidateSet('UEFI', 'BIOS')][string]$BootMode = 'UEFI',
         [switch]$FullCopy,
         [switch]$FixedSizeVHDX,
         [switch]$SkipBootFix,
@@ -578,263 +1154,234 @@ function New-BootableVolumeClone {
     
     $vhdHandle = [IntPtr]::Zero
     $snapshot = $null
-    $winLetter = $null
+    $windowsDriveLetter = $null
     $diskInfo = $null
     
     try {
-        $letter = $SourceVolume.TrimEnd(':', '\').ToUpper()
-        $partition = Get-Partition -DriveLetter $letter
-        $volume = Get-Volume -DriveLetter $letter
+        $driveLetter = $SourceVolume.TrimEnd(':', '\').ToUpper()
+        $partition = Get-Partition -DriveLetter $driveLetter -ErrorAction Stop
+        $partitionSize = $partition.Size
+        $volume = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
         
         if ($volume.FileSystemType -ne 'NTFS' -and -not $FullCopy) {
-            Write-Warning "Non-NTFS volume, forcing full copy"
+            Write-Warning "Volume is $($volume.FileSystemType), not NTFS. Forcing full copy."
             $FullCopy = $true
         }
         
-        $bootSize = if ($BootMode -eq 'UEFI') { 300MB } else { 550MB }
-        $vhdxSize = [uint64]($partition.Size + $bootSize + 100MB)
+        $bootPartitionSize = if ($BootMode -eq 'UEFI') { 300MB } else { 550MB }
+        $vhdxSize = [uint64]($partitionSize + $bootPartitionSize + 100MB)
         $vhdxSize = [uint64]([math]::Ceiling($vhdxSize / 1MB) * 1MB)
         
-        Write-Host "`n$('='*60)" -ForegroundColor Yellow
-        Write-Host "BOOTABLE VOLUME CLONE" -ForegroundColor Yellow
-        Write-Host "$('='*60)`n" -ForegroundColor Yellow
-        Write-Host "  Source:      ${letter}:" -ForegroundColor White
-        Write-Host "  Destination: $DestinationVHDX" -ForegroundColor White
-        Write-Host "  Size:        $([math]::Round($partition.Size/1GB,2)) GB -> $([math]::Round($vhdxSize/1GB,2)) GB VHDX" -ForegroundColor White
-        Write-Host "  Boot Mode:   $BootMode" -ForegroundColor White
-        Write-Host "  Copy Mode:   $(if ($FullCopy) {'Full'} else {'Smart'})`n" -ForegroundColor White
+        Write-Host ""
+        Write-Host "=== Bootable Volume Clone ===" -ForegroundColor Yellow
+        Write-Host "Source: ${driveLetter}:" -ForegroundColor White
+        Write-Host "Destination: $DestinationVHDX" -ForegroundColor White
+        Write-Host "Partition Size: $([math]::Round($partitionSize/1GB, 2)) GB" -ForegroundColor White
+        Write-Host "VHDX Size: $([math]::Round($vhdxSize/1GB, 2)) GB" -ForegroundColor White
+        Write-Host "Boot Mode: $BootMode" -ForegroundColor White
+        Write-Host "Copy Mode: $(if ($FullCopy) { 'Full' } else { 'Smart' })" -ForegroundColor White
+        Write-Host ""
         
-        $volData = $null
+        $volumeData = $null
         if (-not $FullCopy) {
-            $volData = Get-NtfsVolumeData $letter
-            $used = ($volData.TotalClusters - $volData.FreeClusters) * $volData.BytesPerCluster
-            Write-Host "  Used:        $([math]::Round($used/1GB,2)) GB`n" -ForegroundColor DarkGray
+            $volumeData = Get-NtfsVolumeData -DriveLetter $driveLetter
+            $usedBytes = ($volumeData.TotalClusters - $volumeData.FreeClusters) * $volumeData.BytesPerCluster
+            Write-Host "Used space: $([math]::Round($usedBytes / 1GB, 2)) GB" -ForegroundColor DarkGray
+            Write-Host ""
         }
         
-        $snapshot = New-VssSnapshot "${letter}:\"
-        Write-Host "Snapshot: $($snapshot.DeviceObject)" -ForegroundColor Green
+        $snapshot = New-VssSnapshot -Volume "${driveLetter}:\"
+        Write-Host "Snapshot created: $($snapshot.DeviceObject)" -ForegroundColor Green
         
         $vhdHandle = New-RawVHDX -Path $DestinationVHDX -SizeBytes $vhdxSize -FixedSize:$FixedSizeVHDX
-        $physPath = Mount-RawVHDX $vhdHandle
-        Write-Host "Attached: $physPath`n" -ForegroundColor Green
+        
+        $physicalPath = Mount-RawVHDX -Handle $vhdHandle -WithDriveLetter
+        Write-Host "VHDX attached at: $physicalPath" -ForegroundColor Green
         
         Start-Sleep -Seconds 3
-        $diskInfo = Initialize-BootableVHDX $physPath $BootMode
+        
+        $diskInfo = Initialize-BootableVHDX -PhysicalPath $physicalPath -BootMode $BootMode -WindowsPartitionSize $partitionSize
+        
         Start-Sleep -Seconds 2
         
-        $winPart = $diskInfo.WindowsPartition
+        $winPartition = $diskInfo.WindowsPartition
+        $winPartitionOffset = $winPartition.Offset
         $diskPath = "\\.\PhysicalDrive$($diskInfo.DiskNumber)"
-        $blockBytes = $BlockSizeMB * 1MB
         
-        Write-Host "`nPartition offset: $($winPart.Offset) bytes" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "Copying to partition at offset $winPartitionOffset..." -ForegroundColor Cyan
+        Write-Host ""
+        
+        $blockSizeBytes = $BlockSizeMB * 1MB
         
         if ($FullCopy) {
-            Copy-DataToPartition $snapshot.DeviceObject $diskPath $winPart.Offset $partition.Size $blockBytes
+            Copy-VolumeToPartition -SourcePath $snapshot.DeviceObject -DiskPath $diskPath -PartitionOffset $winPartitionOffset -TotalBytes $partitionSize -BlockSize $blockSizeBytes
         }
         else {
-            $bitmap = Get-VolumeBitmap $letter $volData.TotalClusters
-            $alloc = Get-AllocatedRanges $bitmap $volData.TotalClusters $volData.BytesPerCluster
-            Copy-AllocatedData $snapshot.DeviceObject $diskPath $winPart.Offset $alloc.Ranges $volData.BytesPerCluster $alloc.AllocatedBytes $blockBytes
+            $bitmap = Get-VolumeBitmap -DriveLetter $driveLetter -TotalClusters $volumeData.TotalClusters
+            $allocation = Get-AllocatedRanges -Bitmap $bitmap -TotalClusters $volumeData.TotalClusters -BytesPerCluster $volumeData.BytesPerCluster -MinRunClusters 256
+            Write-Host ""
+            Copy-AllocatedBlocksToPartition -SourcePath $snapshot.DeviceObject -DiskPath $diskPath -PartitionOffset $winPartitionOffset -Ranges $allocation.Ranges -BytesPerCluster $volumeData.BytesPerCluster -AllocatedBytes $allocation.AllocatedBytes -BlockSize $blockSizeBytes
         }
         
         if (-not $SkipBootFix) {
-            $winLetter = Get-AvailableDriveLetter
-            if (-not $winLetter) { throw "No drive letters available" }
+            $availableLetters = @([char[]]('W'..'Z' + 'N'..'V') | Where-Object { -not (Test-Path -LiteralPath "$($_):") })
+            if ((Get-SafeCount $availableLetters) -eq 0) { throw "No available drive letters" }
             
-            Write-Host "`nAssigning $winLetter to Windows partition..." -ForegroundColor Cyan
-            $winPart | Set-Partition -NewDriveLetter $winLetter
+            $windowsDriveLetter = $availableLetters[0]
+            Write-Host ""
+            Write-Host "Assigning drive letter $windowsDriveLetter to Windows partition..." -ForegroundColor Cyan
+            $winPartition | Set-Partition -NewDriveLetter $windowsDriveLetter
             Start-Sleep -Seconds 2
             
-            Install-BootFiles $diskInfo $winLetter
+            Install-BootFiles -DiskInfo $diskInfo -WindowsDriveLetter $windowsDriveLetter
             
             Write-Host "Removing drive letter..." -ForegroundColor Cyan
-            try { $winPart | Remove-PartitionAccessPath -AccessPath "${winLetter}:\" -ErrorAction SilentlyContinue } catch { }
-            $winLetter = $null
+            try { $winPartition | Remove-PartitionAccessPath -AccessPath "${windowsDriveLetter}:\" -ErrorAction SilentlyContinue } catch { }
+            $windowsDriveLetter = $null
         }
         
-        Write-Host "`n$('='*60)" -ForegroundColor Green
-        Write-Host "CLONE COMPLETE" -ForegroundColor Green
-        Write-Host "$('='*60)`n" -ForegroundColor Green
-        Write-Host "  File: $DestinationVHDX" -ForegroundColor White
-        Write-Host "  Size: $([math]::Round((Get-Item $DestinationVHDX).Length/1GB,2)) GB`n" -ForegroundColor White
+        Write-Host ""
+        Write-Host "=== Bootable Clone Complete ===" -ForegroundColor Yellow
+        Write-Host "VHDX: $DestinationVHDX" -ForegroundColor Green
+        
+        $vhdxFile = Get-Item -LiteralPath $DestinationVHDX
+        Write-Host "Size: $([math]::Round($vhdxFile.Length/1GB, 2)) GB" -ForegroundColor Cyan
         
         return $DestinationVHDX
     }
     catch {
-        Write-Host "`nClone failed: $_" -ForegroundColor Red
+        Write-Error "Clone failed: $_"
         
-        if ($winLetter -and $diskInfo) {
-            try { $diskInfo.WindowsPartition | Remove-PartitionAccessPath -AccessPath "${winLetter}:\" -ErrorAction SilentlyContinue } catch { }
+        if ($windowsDriveLetter -and $diskInfo) {
+            try { $diskInfo.WindowsPartition | Remove-PartitionAccessPath -AccessPath "${windowsDriveLetter}:\" -ErrorAction SilentlyContinue } catch { }
         }
+        
         if ($vhdHandle -ne [IntPtr]::Zero) {
-            try { Dismount-RawVHDX $vhdHandle } catch { }
+            try { Dismount-RawVHDX -Handle $vhdHandle } catch { }
             $vhdHandle = [IntPtr]::Zero
         }
-        if (Test-Path $DestinationVHDX -ErrorAction SilentlyContinue) {
-            Write-Host "Cleaning up..." -ForegroundColor Yellow
-            Remove-Item $DestinationVHDX -Force -ErrorAction SilentlyContinue
+        
+        if (Test-Path -LiteralPath $DestinationVHDX -ErrorAction SilentlyContinue) {
+            Write-Host "Cleaning up partial VHDX..." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $DestinationVHDX -Force -ErrorAction SilentlyContinue
         }
+        
         throw
     }
     finally {
-        if ($vhdHandle -ne [IntPtr]::Zero) { Dismount-RawVHDX $vhdHandle }
-        if ($snapshot) { Remove-VssSnapshot $snapshot.Id }
+        if ($vhdHandle -ne [IntPtr]::Zero) { Dismount-RawVHDX -Handle $vhdHandle }
+        if ($snapshot) { Remove-VssSnapshot -ShadowId $snapshot.Id }
     }
 }
 
-#endregion
-
-#region Interactive Mode
-
-function Show-Banner {
-    Clear-Host
-    Write-Host "`n  ╔════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║           BOOTABLE VOLUME CLONE UTILITY                    ║" -ForegroundColor Cyan
-    Write-Host "  ║     Clone running Windows to bootable VHDX                 ║" -ForegroundColor Cyan
-    Write-Host "  ╚════════════════════════════════════════════════════════════╝`n" -ForegroundColor Cyan
-}
+# ============================================================
+# Interactive Mode
+# ============================================================
 
 function Start-InteractiveMode {
-    $bootMode = 'UEFI'
-    $fullCopy = $false
-    $fixedVhdx = $false
-    $blockSize = 4
+    $selectedVolume = $null
+    $destinationPath = $null
+    $optBootMode = 'UEFI'
+    $optFullCopy = $false
+    $optFixedSizeVHDX = $false
+    $optBlockSizeMB = 4
     
-    while ($true) {
+    :volumeLoop while ($true) {
         Show-Banner
         
-        $volumes = @(Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and $_.Size -gt 0 } | Sort-Object DriveLetter)
-        if ($volumes.Count -eq 0) {
-            Write-Host "  No volumes found!" -ForegroundColor Red
+        $volumes = @(Get-VolumeList)
+        $volumeCount = Get-SafeCount $volumes
+        
+        if ($volumeCount -eq 0) {
+            Write-Host "  No suitable volumes found!" -ForegroundColor Red
             Wait-KeyPress
             return
         }
         
-        Write-Host "  Available Volumes:`n" -ForegroundColor White
-        for ($i = 0; $i -lt $volumes.Count; $i++) {
-            $v = $volumes[$i]
-            $used = [math]::Round(($v.Size - $v.SizeRemaining) / 1GB, 1)
-            $total = [math]::Round($v.Size / 1GB, 1)
-            $label = if ($v.FileSystemLabel) { $v.FileSystemLabel } else { "Local Disk" }
-            Write-Host "    [$($i+1)] $($v.DriveLetter): $label - $used/$total GB ($($v.FileSystemType))" -ForegroundColor Yellow
-        }
-        Write-Host "    [0] Exit`n" -ForegroundColor Red
+        Show-VolumeMenu -Volumes $volumes
         
-        Write-Host "  Select volume (0-$($volumes.Count)): " -ForegroundColor White -NoNewline
-        $input = Read-Host
+        $selection = Read-MenuSelection -Prompt "Select volume to clone" -Min 0 -Max $volumeCount
+        if ($selection -eq 0) { Write-Host "`n  Goodbye!" -ForegroundColor Cyan; return }
         
-        $sel = 0
-        if (-not [int]::TryParse($input, [ref]$sel) -or $sel -lt 0 -or $sel -gt $volumes.Count) {
-            Write-Host "  Invalid selection" -ForegroundColor Red
-            Start-Sleep -Seconds 1
-            continue
-        }
-        if ($sel -eq 0) { Write-Host "`n  Goodbye!" -ForegroundColor Cyan; return }
+        $selectedVolume = $volumes[$selection - 1].DriveLetter
+        $volumeInfo = $volumes[$selection - 1]
         
-        $srcVol = $volumes[$sel - 1]
-        $srcLetter = $srcVol.DriveLetter
+        $defaultName = "Bootable_${selectedVolume}_$(Get-Date -Format 'yyyyMMdd_HHmmss').vhdx"
+        $destDrives = @(Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne $selectedVolume -and $_.DriveType -eq 'Fixed' -and $_.SizeRemaining -gt ($volumeInfo.Size + 1GB) } | Sort-Object SizeRemaining -Descending)
+        $defaultPath = if ((Get-SafeCount $destDrives) -gt 0) { "$($destDrives[0].DriveLetter):\VMs\$defaultName" } else { "${selectedVolume}:\VMs\$defaultName" }
         
-        # Default destination
-        $defaultDest = "${srcLetter}:\VMs\Bootable_${srcLetter}_$(Get-Date -Format 'yyyyMMdd_HHmmss').vhdx"
-        $otherDrives = @(Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne $srcLetter -and $_.DriveType -eq 'Fixed' -and $_.SizeRemaining -gt ($srcVol.Size + 1GB) } | Sort-Object SizeRemaining -Descending)
-        if ($otherDrives.Count -gt 0) {
-            $defaultDest = "$($otherDrives[0].DriveLetter):\VMs\Bootable_${srcLetter}_$(Get-Date -Format 'yyyyMMdd_HHmmss').vhdx"
-        }
+        Write-Host ""
+        $destinationPath = Read-PathInput -Prompt "Destination VHDX path" -Default $defaultPath -RequiredExtension ".vhdx"
         
-        Write-Host "`n  Destination VHDX path"
-        Write-Host "  [Default: $defaultDest]"
-        Write-Host "  : " -NoNewline
-        $destPath = Read-Host
-        if ([string]::IsNullOrWhiteSpace($destPath)) { $destPath = $defaultDest }
-        if (-not $destPath.ToLower().EndsWith('.vhdx')) { $destPath += '.vhdx' }
-        
-        # Options menu
-        while ($true) {
+        :optionsLoop while ($true) {
             Show-Banner
-            Write-Host "  Source: ${srcLetter}: ($($srcVol.FileSystemLabel))" -ForegroundColor White
-            Write-Host "  Destination: $destPath`n" -ForegroundColor White
+            $volumeLabel = if ($volumeInfo.FileSystemLabel) { $volumeInfo.FileSystemLabel } else { "Local Disk" }
             
+            Write-Host "  Source: ${selectedVolume}: ($volumeLabel)" -ForegroundColor White
+            Write-Host "  Destination: $destinationPath" -ForegroundColor White
+            Write-Host ""
             Write-Host "  Options:" -ForegroundColor White
-            Write-Host "    [1] Boot Mode:  $bootMode" -ForegroundColor Yellow
-            Write-Host "    [2] Copy Mode:  $(if($fullCopy){'Full'}else{'Smart'})" -ForegroundColor Yellow
-            Write-Host "    [3] VHDX Type:  $(if($fixedVhdx){'Fixed'}else{'Dynamic'})" -ForegroundColor Yellow
-            Write-Host "    [4] Block Size: ${blockSize}MB`n" -ForegroundColor Yellow
-            Write-Host "    [S] Start Clone" -ForegroundColor Green
-            Write-Host "    [C] Change Path" -ForegroundColor Cyan
-            Write-Host "    [B] Back" -ForegroundColor DarkYellow
-            Write-Host "    [Q] Quit`n" -ForegroundColor Red
-            
+            Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "    [1] Boot Mode:     $optBootMode" -ForegroundColor Yellow
+            Write-Host "    [2] Copy Mode:     $(if ($optFullCopy) { 'Full' } else { 'Smart' })" -ForegroundColor Yellow
+            Write-Host "    [3] VHDX Type:     $(if ($optFixedSizeVHDX) { 'Fixed' } else { 'Dynamic' })" -ForegroundColor Yellow
+            Write-Host "    [4] Block Size:    $optBlockSizeMB MB" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "    [S] Start  [C] Change Path  [B] Back  [0] Exit" -ForegroundColor Gray
+            Write-Host ""
             Write-Host "  Choice: " -ForegroundColor White -NoNewline
-            $choice = (Read-Host).Trim().ToUpper()
             
-            switch ($choice) {
-                '1' { $bootMode = if ($bootMode -eq 'UEFI') { 'BIOS' } else { 'UEFI' } }
-                '2' { $fullCopy = -not $fullCopy }
-                '3' { $fixedVhdx = -not $fixedVhdx }
-                '4' {
-                    Write-Host "  Block size (1-64) [$blockSize]: " -NoNewline
-                    $bs = Read-Host
-                    $bsNum = 0
-                    if ([int]::TryParse($bs, [ref]$bsNum) -and $bsNum -ge 1 -and $bsNum -le 64) { $blockSize = $bsNum }
+            switch ((Read-Host).ToUpper()) {
+                "1" { $optBootMode = if ($optBootMode -eq 'UEFI') { 'BIOS' } else { 'UEFI' } }
+                "2" { $optFullCopy = -not $optFullCopy }
+                "3" { $optFixedSizeVHDX = -not $optFixedSizeVHDX }
+                "4" {
+                    Write-Host "  Block size (1-64) [$optBlockSizeMB]: " -NoNewline
+                    $inp = Read-Host
+                    if ($inp -match '^\d+$' -and [int]$inp -ge 1 -and [int]$inp -le 64) { $optBlockSizeMB = [int]$inp }
                 }
-                'C' {
-                    Write-Host "  New path [$destPath]: " -NoNewline
-                    $np = Read-Host
-                    if (-not [string]::IsNullOrWhiteSpace($np)) {
-                        $destPath = $np
-                        if (-not $destPath.ToLower().EndsWith('.vhdx')) { $destPath += '.vhdx' }
+                "C" { Write-Host ""; $destinationPath = Read-PathInput -Prompt "New path" -Default $destinationPath -RequiredExtension ".vhdx" }
+                "B" { continue volumeLoop }
+                "S" {
+                    if (Test-Path -LiteralPath $destinationPath) {
+                        if (-not (Read-YesNo -Prompt "Overwrite existing file?" -Default $false)) { continue }
+                        Remove-Item -LiteralPath $destinationPath -Force
+                    }
+                    
+                    if (Read-YesNo -Prompt "Start clone?" -Default $true) {
+                        Write-Host ""
+                        try {
+                            New-BootableVolumeClone -SourceVolume $selectedVolume -DestinationVHDX $destinationPath -BootMode $optBootMode -FullCopy:$optFullCopy -FixedSizeVHDX:$optFixedSizeVHDX -BlockSizeMB $optBlockSizeMB
+                            Write-Host "`n  Clone completed!" -ForegroundColor Green
+                        }
+                        catch { Write-Host "`n  Clone failed: $_" -ForegroundColor Red }
+                        
+                        Write-Host ""
+                        Wait-KeyPress
+                        
+                        if (-not (Read-YesNo -Prompt "Clone another?" -Default $false)) { return }
+                        continue volumeLoop
                     }
                 }
-                'B' { break }
-                'Q' { Write-Host "`n  Goodbye!" -ForegroundColor Cyan; return }
-                'S' {
-                    if (Test-Path $destPath) {
-                        Write-Host "  File exists. Overwrite? (y/N): " -NoNewline
-                        if ((Read-Host).Trim().ToLower() -ne 'y') { continue }
-                        Remove-Item $destPath -Force
-                    }
-                    
-                    Write-Host "  Start clone? (Y/n): " -NoNewline
-                    $confirm = (Read-Host).Trim().ToLower()
-                    if ($confirm -eq 'n') { continue }
-                    
-                    Write-Host ""
-                    try {
-                        New-BootableVolumeClone -SourceVolume $srcLetter -DestinationVHDX $destPath -BootMode $bootMode -FullCopy:$fullCopy -FixedSizeVHDX:$fixedVhdx -BlockSizeMB $blockSize
-                        Write-Host "  Success!" -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Host "  Failed: $_" -ForegroundColor Red
-                    }
-                    
-                    Wait-KeyPress
-                    
-                    Write-Host "  Clone another? (y/N): " -NoNewline
-                    if ((Read-Host).Trim().ToLower() -ne 'y') {
-                        Write-Host "`n  Goodbye!" -ForegroundColor Cyan
-                        return
-                    }
-                    break
-                }
+                "0" { Write-Host "`n  Goodbye!" -ForegroundColor Cyan; return }
             }
-            
-            if ($choice -eq 'B') { break }
         }
     }
 }
 
-#endregion
-
-#region Entry Point
+# ============================================================
+# Entry Point
+# ============================================================
 
 if ($PSCmdlet.ParameterSetName -eq 'Interactive' -or (-not $SourceVolume -and -not $DestinationVHDX)) {
     Start-InteractiveMode
 }
 else {
     if (-not $SourceVolume -or -not $DestinationVHDX) {
-        throw "SourceVolume and DestinationVHDX are required"
+        throw "SourceVolume and DestinationVHDX required. Run without parameters for interactive mode."
     }
+    
     New-BootableVolumeClone -SourceVolume $SourceVolume -DestinationVHDX $DestinationVHDX -BootMode $BootMode -FullCopy:$FullCopy -FixedSizeVHDX:$FixedSizeVHDX -SkipBootFix:$SkipBootFix -BlockSizeMB $BlockSizeMB
 }
-
-#endregion
