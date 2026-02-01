@@ -73,8 +73,6 @@ Simply run the script without parameters for a menu-driven experience:
 .\Clone.ps1
 ```
 
-![Interactive Menu](docs/interactive.png)
-
 ### Command Line Mode
 
 ```powershell
