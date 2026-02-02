@@ -1052,7 +1052,7 @@ function Get-AllocatedRanges {
         }
         
         if ($byteIndex % $progressInterval -eq 0) {
-            $pct = [int](($byteIndex / $totalBytes) * 100)
+            $pct = [math]::Min(100, [int](($byteIndex / $totalBytes) * 100))
             Write-Progress -Activity "Analyzing Bitmap" -Status "$pct%" -PercentComplete $pct
         }
     }
@@ -1254,7 +1254,7 @@ function Copy-VolumeToPartition {
             }
             
             $totalCopied += $bytesRead
-            $pct = [math]::Floor(($totalCopied / $TotalBytes) * 100)
+            $pct = [math]::Min(100, [math]::Floor(($totalCopied / $TotalBytes) * 100))
             if ($pct -gt $lastPct) {
                 $speed = if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB } else { 0 }
                 Write-Progress -Activity "Copying" -Status "$pct% - $([math]::Round($speed,1)) MB/s" -PercentComplete $pct
@@ -1329,7 +1329,7 @@ function Copy-AllocatedBlocksToPartition {
                 $clusterOffset += $clustersToRead
                 $clustersRemaining -= $clustersToRead
                 
-                $pct = [math]::Floor(($totalCopied / $AllocatedBytes) * 100)
+                $pct = [math]::Min(100, [math]::Floor(($totalCopied / $AllocatedBytes) * 100))
                 if ($pct -gt $lastPct) {
                     $speed = if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $totalCopied / $stopwatch.Elapsed.TotalSeconds / 1MB } else { 0 }
                     Write-Progress -Activity "Copying" -Status "$pct% - $([math]::Round($speed,1)) MB/s" -PercentComplete $pct
