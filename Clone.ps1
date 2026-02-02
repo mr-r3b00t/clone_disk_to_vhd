@@ -1097,19 +1097,25 @@ function Copy-VolumeToPartition {
             
             $bytesRead = [uint32]0
             if (-not [NativeDiskApi]::ReadFile($sourceHandle, $buffer, $alignedBytes, [ref]$bytesRead, [IntPtr]::Zero)) {
-                throw "Read failed at offset $totalCopied"
+                $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
+                throw "Read failed at source offset $totalCopied. Attempted $alignedBytes bytes. Error $win32Err - $errMsg"
             }
             if ($bytesRead -eq 0) { break }
             
             $destOffset = $PartitionOffset + $totalCopied
             $newPos = [long]0
             if (-not [NativeDiskApi]::SetFilePointerEx($destHandle, $destOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN)) {
-                throw "Seek failed"
+                $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
+                throw "Seek failed to offset $destOffset. Error $win32Err - $errMsg"
             }
             
             $bytesWritten = [uint32]0
             if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
-                throw "Write failed"
+                $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
+                throw "Write failed at offset $destOffset. Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg"
             }
             
             $totalCopied += $bytesRead
@@ -1165,7 +1171,9 @@ function Copy-AllocatedBlocksToPartition {
                 
                 $bytesRead = [uint32]0
                 if (-not [NativeDiskApi]::ReadFile($sourceHandle, $buffer, $bytesToRead, [ref]$bytesRead, [IntPtr]::Zero)) {
-                    throw "Read failed"
+                    $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
+                    throw "Read failed at offset $sourceByteOffset (cluster $clusterOffset). Tried $bytesToRead bytes. Error $win32Err - $errMsg"
                 }
                 
                 $destByteOffset = $PartitionOffset + $sourceByteOffset
@@ -1173,7 +1181,9 @@ function Copy-AllocatedBlocksToPartition {
                 
                 $bytesWritten = [uint32]0
                 if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
-                    throw "Write failed"
+                    $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
+                    throw "Write failed at offset $destByteOffset (cluster $clusterOffset). Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg"
                 }
                 
                 $totalCopied += $bytesRead
