@@ -271,6 +271,9 @@ public static class NativeDiskApi
     
     public const uint FSCTL_GET_VOLUME_BITMAP = 0x0009006F;
     public const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
+    public const uint FSCTL_LOCK_VOLUME = 0x00090018;
+    public const uint FSCTL_UNLOCK_VOLUME = 0x0009001C;
+    public const uint FSCTL_DISMOUNT_VOLUME = 0x00090020;
     
     [StructLayout(LayoutKind.Sequential)]
     public struct NTFS_VOLUME_DATA_BUFFER
@@ -1088,6 +1091,97 @@ function Get-AllocatedRanges {
 # Raw Disk I/O
 # ============================================================
 
+function Lock-DiskVolumes {
+    param([int]$DiskNumber)
+    
+    # Lock and dismount all volumes on the disk to allow raw write access
+    # Returns array of handles that must be kept open until writing is complete
+    
+    $handles = @()
+    $partitions = Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue
+    
+    foreach ($part in $partitions) {
+        # Get volume path for this partition
+        $volumePath = "\\.\HarddiskVolume$($part.PartitionNumber)"
+        
+        # Also try GUID-based path
+        $accessPaths = $part.AccessPaths | Where-Object { $_ -match '^\\\\\?\\Volume' }
+        if ($accessPaths) {
+            $volumePath = ($accessPaths | Select-Object -First 1) -replace '\\$', ''
+        }
+        
+        # Try to open the volume
+        try {
+            $handle = [NativeDiskApi]::CreateFile(
+                $volumePath,
+                ([NativeDiskApi]::GENERIC_READ -bor [NativeDiskApi]::GENERIC_WRITE),
+                ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+                [IntPtr]::Zero,
+                [NativeDiskApi]::OPEN_EXISTING,
+                0,
+                [IntPtr]::Zero
+            )
+            
+            if (-not $handle.IsInvalid) {
+                # Try to lock the volume
+                $bytesReturned = [uint32]0
+                $lockResult = [NativeDiskApi]::DeviceIoControl(
+                    $handle,
+                    [NativeDiskApi]::FSCTL_LOCK_VOLUME,
+                    [IntPtr]::Zero, 0,
+                    [IntPtr]::Zero, 0,
+                    [ref]$bytesReturned,
+                    [IntPtr]::Zero
+                )
+                
+                if ($lockResult) {
+                    # Dismount the volume
+                    $null = [NativeDiskApi]::DeviceIoControl(
+                        $handle,
+                        [NativeDiskApi]::FSCTL_DISMOUNT_VOLUME,
+                        [IntPtr]::Zero, 0,
+                        [IntPtr]::Zero, 0,
+                        [ref]$bytesReturned,
+                        [IntPtr]::Zero
+                    )
+                    $handles += $handle
+                    Write-Host "      Locked volume for partition $($part.PartitionNumber)" -ForegroundColor DarkGray
+                }
+                else {
+                    $handle.Close()
+                }
+            }
+        }
+        catch {
+            # Ignore errors - not all partitions have accessible volumes
+        }
+    }
+    
+    return $handles
+}
+
+function Unlock-DiskVolumes {
+    param([array]$Handles)
+    
+    foreach ($handle in $Handles) {
+        if ($handle -and -not $handle.IsClosed) {
+            try {
+                $bytesReturned = [uint32]0
+                $null = [NativeDiskApi]::DeviceIoControl(
+                    $handle,
+                    [NativeDiskApi]::FSCTL_UNLOCK_VOLUME,
+                    [IntPtr]::Zero, 0,
+                    [IntPtr]::Zero, 0,
+                    [ref]$bytesReturned,
+                    [IntPtr]::Zero
+                )
+                $handle.Close()
+            }
+            catch { }
+        }
+    }
+}
+
 function Open-RawDisk {
     param([string]$Path, [ValidateSet('Read', 'Write', 'ReadWrite')][string]$Access)
     
@@ -1393,44 +1487,64 @@ function New-BootableVolumeClone {
             }
         }
         
-        # Take disk offline and online to release any lingering locks
-        Write-Host "    Cycling disk offline/online to release locks..." -ForegroundColor DarkGray
-        try {
-            Set-Disk -Number $diskInfo.DiskNumber -IsOffline $true -ErrorAction Stop
-            Start-Sleep -Milliseconds 500
-            Set-Disk -Number $diskInfo.DiskNumber -IsOffline $false -ErrorAction Stop
-            Start-Sleep -Seconds 1
-        }
-        catch {
-            Write-Host "      Warning: Could not cycle disk: $_" -ForegroundColor Yellow
-        }
+        # Wait for disk to settle after removing access paths
+        Start-Sleep -Seconds 2
         
-        # Refresh partition info after cycling
+        # Refresh partition info
         $winPartition = Get-Partition -DiskNumber $diskInfo.DiskNumber | Where-Object { $_.Size -eq ($partitions | Sort-Object Size -Descending | Select-Object -First 1).Size } | Select-Object -First 1
         if (-not $winPartition) {
             $winPartition = $diskInfo.WindowsPartition
         }
         $winPartitionOffset = $winPartition.Offset
         
-        # Diagnostic info
+        # Diagnostic info and readiness check
         $disk = Get-Disk -Number $diskInfo.DiskNumber
         Write-Host "    Disk status: Online=$(-not $disk.IsOffline), ReadOnly=$($disk.IsReadOnly), OperationalStatus=$($disk.OperationalStatus)" -ForegroundColor DarkGray
+        
+        # Wait for disk to be fully ready
+        $retryCount = 0
+        $maxRetries = 10
+        while ($retryCount -lt $maxRetries) {
+            $disk = Get-Disk -Number $diskInfo.DiskNumber
+            if ($disk.OperationalStatus -eq 'Online' -and -not $disk.IsOffline -and -not $disk.IsReadOnly) {
+                break
+            }
+            Write-Host "    Waiting for disk to be ready (attempt $($retryCount + 1)/$maxRetries)..." -ForegroundColor DarkGray
+            Start-Sleep -Seconds 1
+            $retryCount++
+        }
+        
+        if ($disk.OperationalStatus -ne 'Online') {
+            Write-Host "    Warning: Disk operational status is '$($disk.OperationalStatus)', proceeding anyway..." -ForegroundColor Yellow
+        }
         
         Write-Host ""
         Write-Host "  Copying to partition at offset $winPartitionOffset..." -ForegroundColor Cyan
         Write-Host "  Disk path: $diskPath" -ForegroundColor DarkGray
         Write-Host ""
         
+        # Lock all volumes on the disk to ensure exclusive access for raw writes
+        Write-Host "    Locking volumes for exclusive access..." -ForegroundColor DarkGray
+        $volumeLocks = Lock-DiskVolumes -DiskNumber $diskInfo.DiskNumber
+        
         $blockSizeBytes = $BlockSizeMB * 1MB
         
-        if ($FullCopy) {
-            Copy-VolumeToPartition -SourcePath $snapshot.DeviceObject -DiskPath $diskPath -PartitionOffset $winPartitionOffset -TotalBytes $partitionSize -BlockSize $blockSizeBytes
+        try {
+            if ($FullCopy) {
+                Copy-VolumeToPartition -SourcePath $snapshot.DeviceObject -DiskPath $diskPath -PartitionOffset $winPartitionOffset -TotalBytes $partitionSize -BlockSize $blockSizeBytes
+            }
+            else {
+                $bitmap = Get-VolumeBitmap -DriveLetter $driveLetter -TotalClusters $volumeData.TotalClusters
+                $allocation = Get-AllocatedRanges -Bitmap $bitmap -TotalClusters $volumeData.TotalClusters -BytesPerCluster $volumeData.BytesPerCluster -MinRunClusters 256
+                Write-Host ""
+                Copy-AllocatedBlocksToPartition -SourcePath $snapshot.DeviceObject -DiskPath $diskPath -PartitionOffset $winPartitionOffset -Ranges $allocation.Ranges -BytesPerCluster $volumeData.BytesPerCluster -AllocatedBytes $allocation.AllocatedBytes -BlockSize $blockSizeBytes
+            }
         }
-        else {
-            $bitmap = Get-VolumeBitmap -DriveLetter $driveLetter -TotalClusters $volumeData.TotalClusters
-            $allocation = Get-AllocatedRanges -Bitmap $bitmap -TotalClusters $volumeData.TotalClusters -BytesPerCluster $volumeData.BytesPerCluster -MinRunClusters 256
-            Write-Host ""
-            Copy-AllocatedBlocksToPartition -SourcePath $snapshot.DeviceObject -DiskPath $diskPath -PartitionOffset $winPartitionOffset -Ranges $allocation.Ranges -BytesPerCluster $volumeData.BytesPerCluster -AllocatedBytes $allocation.AllocatedBytes -BlockSize $blockSizeBytes
+        finally {
+            # Unlock volumes after copy
+            if ($volumeLocks) {
+                Unlock-DiskVolumes -Handles $volumeLocks
+            }
         }
         
         # Install boot files
