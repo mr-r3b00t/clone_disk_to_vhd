@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+\xEF\xBB\xBF#Requires -RunAsAdministrator
 #Requires -Version 5.1
 
 <#
@@ -346,14 +346,14 @@ if (-not $typesOK) {
     }
     catch {
         Write-Host ""
-        Write-Host "╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
-        Write-Host "║  ERROR: Type loading failed due to cached types from previous run ║" -ForegroundColor Red
-        Write-Host "╠═══════════════════════════════════════════════════════════════════╣" -ForegroundColor Red
-        Write-Host "║                                                                   ║" -ForegroundColor Red
-        Write-Host "║  SOLUTION: Close this PowerShell window completely and open       ║" -ForegroundColor Yellow
-        Write-Host "║            a NEW PowerShell window (as Administrator).            ║" -ForegroundColor Yellow
-        Write-Host "║                                                                   ║" -ForegroundColor Red
-        Write-Host "╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+        Write-Host "+===================================================================+" -ForegroundColor Red
+        Write-Host "|  ERROR: Type loading failed due to cached types from previous run |" -ForegroundColor Red
+        Write-Host "+===================================================================+" -ForegroundColor Red
+        Write-Host "|                                                                   |" -ForegroundColor Red
+        Write-Host "|  SOLUTION: Close this PowerShell window completely and open       |" -ForegroundColor Yellow
+        Write-Host "|            a NEW PowerShell window (as Administrator).            |" -ForegroundColor Yellow
+        Write-Host "|                                                                   |" -ForegroundColor Red
+        Write-Host "+===================================================================+" -ForegroundColor Red
         Write-Host ""
         throw "Please restart PowerShell and try again. Error: $_"
     }
@@ -431,18 +431,18 @@ function Remove-CreateVirtualDiskParameters {
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  ╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ║        " -ForegroundColor Cyan -NoNewline
+    Write-Host "  +==============================================================+" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  |        " -ForegroundColor Cyan -NoNewline
     Write-Host "BOOTABLE VOLUME CLONE UTILITY" -ForegroundColor Yellow -NoNewline
-    Write-Host "                      ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ║   Clone a running Windows volume to a bootable VHDX file    ║" -ForegroundColor Cyan
-    Write-Host "  ║   Supports Hyper-V VMs and Native VHD Boot                  ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ║   Uses virtdisk.dll - No Hyper-V module required            ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "                      |" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  |   Clone a running Windows volume to a bootable VHDX file    |" -ForegroundColor Cyan
+    Write-Host "  |   Supports Hyper-V VMs and Native VHD Boot                  |" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  |   Uses virtdisk.dll - No Hyper-V module required            |" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  +==============================================================+" -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -458,7 +458,7 @@ function Show-VolumeMenu {
     param([array]$Volumes)
     
     Write-Host "  Available Volumes:" -ForegroundColor White
-    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  -------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     
     $index = 1
@@ -475,8 +475,8 @@ function Show-VolumeMenu {
         
         $filledBar = ""
         $emptyBar = ""
-        if ($filledLength -gt 0) { $filledBar = [string]::new([char]0x2588, $filledLength) }
-        if ($emptyLength -gt 0) { $emptyBar = [string]::new([char]0x2591, $emptyLength) }
+        if ($filledLength -gt 0) { $filledBar = [string]::new([char]0x23, $filledLength) }
+        if ($emptyLength -gt 0) { $emptyBar = [string]::new([char]0x2D, $emptyLength) }
         $progressBar = "[$filledBar$emptyBar]"
         
         Write-Host "    [$index] " -ForegroundColor Yellow -NoNewline
@@ -1260,9 +1260,9 @@ function New-BootableVolumeClone {
         Test-DestinationSpace -DestPath $DestinationVHDX -RequiredBytes $requiredDiskSpace
         
         Write-Host ""
-        Write-Host "╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
-        Write-Host "║                    BOOTABLE VOLUME CLONE                          ║" -ForegroundColor Yellow
-        Write-Host "╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
+        Write-Host "+===================================================================+" -ForegroundColor Yellow
+        Write-Host "|                    BOOTABLE VOLUME CLONE                          |" -ForegroundColor Yellow
+        Write-Host "+===================================================================+" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "  Source:      ${driveLetter}:" -ForegroundColor White
         Write-Host "  Destination: $DestinationVHDX" -ForegroundColor White
@@ -1337,9 +1337,9 @@ function New-BootableVolumeClone {
         }
         
         Write-Host ""
-        Write-Host "╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Green
-        Write-Host "║                    CLONE COMPLETED SUCCESSFULLY                   ║" -ForegroundColor Green
-        Write-Host "╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+        Write-Host "+===================================================================+" -ForegroundColor Green
+        Write-Host "|                    CLONE COMPLETED SUCCESSFULLY                   |" -ForegroundColor Green
+        Write-Host "+===================================================================+" -ForegroundColor Green
         Write-Host ""
         Write-Host "  VHDX File: $DestinationVHDX" -ForegroundColor White
         
@@ -1426,7 +1426,7 @@ function Start-InteractiveMode {
             Write-Host "  Destination: $destinationPath" -ForegroundColor White
             Write-Host ""
             Write-Host "  Options:" -ForegroundColor White
-            Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host "  -------------------------------------------------------------" -ForegroundColor DarkGray
             Write-Host ""
             Write-Host "    [1] Boot Mode:     $optBootMode" -ForegroundColor Yellow
             Write-Host "    [2] Copy Mode:     $(if ($optFullCopy) { 'Full (all sectors)' } else { 'Smart (allocated only)' })" -ForegroundColor Yellow
