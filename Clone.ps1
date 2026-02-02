@@ -140,6 +140,17 @@ function Test-DestinationSpace {
     return $true
 }
 
+function Test-ControlledFolderAccess {
+    param(
+        [string]$DestinationPath
+    )
+    
+    # Note: If CFA blocks an operation, it gets logged in Windows Security.
+    # If Error 5 occurs without a CFA log entry, CFA is not the cause.
+    # Keeping this function stub for compatibility.
+    return $true
+}
+
 function Get-AvailableDriveLetter {
     param([array]$Exclude = @())
     
@@ -346,14 +357,14 @@ if (-not $typesOK) {
     }
     catch {
         Write-Host ""
-        Write-Host "╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
-        Write-Host "║  ERROR: Type loading failed due to cached types from previous run ║" -ForegroundColor Red
-        Write-Host "╠═══════════════════════════════════════════════════════════════════╣" -ForegroundColor Red
-        Write-Host "║                                                                   ║" -ForegroundColor Red
-        Write-Host "║  SOLUTION: Close this PowerShell window completely and open       ║" -ForegroundColor Yellow
-        Write-Host "║            a NEW PowerShell window (as Administrator).            ║" -ForegroundColor Yellow
-        Write-Host "║                                                                   ║" -ForegroundColor Red
-        Write-Host "╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+        Write-Host "+===================================================================+" -ForegroundColor Red
+        Write-Host "|  ERROR: Type loading failed due to cached types from previous run |" -ForegroundColor Red
+        Write-Host "+===================================================================+" -ForegroundColor Red
+        Write-Host "|                                                                   |" -ForegroundColor Red
+        Write-Host "|  SOLUTION: Close this PowerShell window completely and open       |" -ForegroundColor Yellow
+        Write-Host "|            a NEW PowerShell window (as Administrator).            |" -ForegroundColor Yellow
+        Write-Host "|                                                                   |" -ForegroundColor Red
+        Write-Host "+===================================================================+" -ForegroundColor Red
         Write-Host ""
         throw "Please restart PowerShell and try again. Error: $_"
     }
@@ -431,18 +442,18 @@ function Remove-CreateVirtualDiskParameters {
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  ╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ║        " -ForegroundColor Cyan -NoNewline
+    Write-Host "  +==============================================================+" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  |        " -ForegroundColor Cyan -NoNewline
     Write-Host "BOOTABLE VOLUME CLONE UTILITY" -ForegroundColor Yellow -NoNewline
-    Write-Host "                      ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ║   Clone a running Windows volume to a bootable VHDX file    ║" -ForegroundColor Cyan
-    Write-Host "  ║   Supports Hyper-V VMs and Native VHD Boot                  ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ║   Uses virtdisk.dll - No Hyper-V module required            ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
-    Write-Host "  ╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "                      |" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  |   Clone a running Windows volume to a bootable VHDX file    |" -ForegroundColor Cyan
+    Write-Host "  |   Supports Hyper-V VMs and Native VHD Boot                  |" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  |   Uses virtdisk.dll - No Hyper-V module required            |" -ForegroundColor Cyan
+    Write-Host "  |                                                              |" -ForegroundColor Cyan
+    Write-Host "  +==============================================================+" -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -458,7 +469,7 @@ function Show-VolumeMenu {
     param([array]$Volumes)
     
     Write-Host "  Available Volumes:" -ForegroundColor White
-    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  -------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     
     $index = 1
@@ -475,8 +486,8 @@ function Show-VolumeMenu {
         
         $filledBar = ""
         $emptyBar = ""
-        if ($filledLength -gt 0) { $filledBar = [string]::new([char]0x2588, $filledLength) }
-        if ($emptyLength -gt 0) { $emptyBar = [string]::new([char]0x2591, $emptyLength) }
+        if ($filledLength -gt 0) { $filledBar = [string]::new([char]0x23, $filledLength) }
+        if ($emptyLength -gt 0) { $emptyBar = [string]::new([char]0x2D, $emptyLength) }
         $progressBar = "[$filledBar$emptyBar]"
         
         Write-Host "    [$index] " -ForegroundColor Yellow -NoNewline
@@ -770,8 +781,21 @@ function Initialize-BootableVHDX {
         Start-Sleep -Seconds 2
         
         Write-Host "  Creating EFI System Partition (260 MB)..." -ForegroundColor DarkGray
-        $espPartition = New-Partition -DiskNumber $diskNumber -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-        Format-Volume -Partition $espPartition -FileSystem FAT32 -NewFileSystemLabel "System" -Confirm:$false | Out-Null
+        # Create partition with a temporary drive letter for formatting
+        $tempEspLetter = Get-AvailableDriveLetter
+        $espPartition = New-Partition -DiskNumber $diskNumber -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -DriveLetter $tempEspLetter
+        Start-Sleep -Seconds 1
+        
+        # Format using drive letter (more reliable on Azure)
+        Write-Host "    Formatting as FAT32..." -ForegroundColor DarkGray
+        $null = Format-Volume -DriveLetter $tempEspLetter -FileSystem FAT32 -NewFileSystemLabel "System" -Confirm:$false -ErrorAction Stop
+        
+        # Remove the temporary drive letter
+        Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $espPartition.PartitionNumber -AccessPath "$($tempEspLetter):\" -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+        
+        # Refresh partition object
+        $espPartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $espPartition.PartitionNumber
         
         Write-Host "  Creating Microsoft Reserved Partition (16 MB)..." -ForegroundColor DarkGray
         $null = New-Partition -DiskNumber $diskNumber -Size 16MB -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
@@ -787,8 +811,21 @@ function Initialize-BootableVHDX {
         Start-Sleep -Seconds 2
         
         Write-Host "  Creating System Reserved partition (500 MB)..." -ForegroundColor DarkGray
-        $sysPartition = New-Partition -DiskNumber $diskNumber -Size 500MB -IsActive
-        Format-Volume -Partition $sysPartition -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false | Out-Null
+        # Create partition with a temporary drive letter for formatting
+        $tempSysLetter = Get-AvailableDriveLetter
+        $sysPartition = New-Partition -DiskNumber $diskNumber -Size 500MB -IsActive -DriveLetter $tempSysLetter
+        Start-Sleep -Seconds 1
+        
+        # Format using drive letter (more reliable on Azure)
+        Write-Host "    Formatting as NTFS..." -ForegroundColor DarkGray
+        $null = Format-Volume -DriveLetter $tempSysLetter -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false -ErrorAction Stop
+        
+        # Remove the temporary drive letter
+        Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $sysPartition.PartitionNumber -AccessPath "$($tempSysLetter):\" -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+        
+        # Refresh partition object
+        $sysPartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $sysPartition.PartitionNumber
         
         Write-Host "  Creating Windows partition..." -ForegroundColor DarkGray
         $winPartition = New-Partition -DiskNumber $diskNumber -UseMaximumSize
@@ -1084,7 +1121,7 @@ function Copy-VolumeToPartition {
     Write-Host "Copying $(Format-Size $TotalBytes) to partition..." -ForegroundColor Cyan
     
     $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
-    $destHandle = Open-RawDisk -Path $DiskPath -Access Write
+    $destHandle = Open-RawDisk -Path $DiskPath -Access ReadWrite
     
     try {
         $buffer = New-Object byte[] $BlockSize
@@ -1115,7 +1152,11 @@ function Copy-VolumeToPartition {
             if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
                 $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
                 $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
-                throw "Write failed at offset $destOffset. Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg"
+                $hint = ""
+                if ($win32Err -eq 5) {
+                    $hint = ". Possible causes: disk is read-only, another process has disk locked, or security software blocking raw disk writes"
+                }
+                throw "Write failed at offset $destOffset. Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg$hint"
             }
             
             $totalCopied += $bytesRead
@@ -1149,7 +1190,7 @@ function Copy-AllocatedBlocksToPartition {
     Write-Host "Copying $(Format-Size $AllocatedBytes) of allocated data..." -ForegroundColor Cyan
     
     $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
-    $destHandle = Open-RawDisk -Path $DiskPath -Access Write
+    $destHandle = Open-RawDisk -Path $DiskPath -Access ReadWrite
     
     try {
         $buffer = New-Object byte[] $BlockSize
@@ -1183,7 +1224,11 @@ function Copy-AllocatedBlocksToPartition {
                 if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
                     $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
                     $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
-                    throw "Write failed at offset $destByteOffset (cluster $clusterOffset). Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg"
+                    $hint = ""
+                    if ($win32Err -eq 5) {
+                        $hint = ". Possible causes: disk is read-only, another process has disk locked, or security software blocking raw disk writes"
+                    }
+                    throw "Write failed at offset $destByteOffset (cluster $clusterOffset). Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg$hint"
                 }
                 
                 $totalCopied += $bytesRead
@@ -1260,9 +1305,9 @@ function New-BootableVolumeClone {
         Test-DestinationSpace -DestPath $DestinationVHDX -RequiredBytes $requiredDiskSpace
         
         Write-Host ""
-        Write-Host "╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
-        Write-Host "║                    BOOTABLE VOLUME CLONE                          ║" -ForegroundColor Yellow
-        Write-Host "╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
+        Write-Host "+===================================================================+" -ForegroundColor Yellow
+        Write-Host "|                    BOOTABLE VOLUME CLONE                          |" -ForegroundColor Yellow
+        Write-Host "+===================================================================+" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "  Source:      ${driveLetter}:" -ForegroundColor White
         Write-Host "  Destination: $DestinationVHDX" -ForegroundColor White
@@ -1303,8 +1348,77 @@ function New-BootableVolumeClone {
         $winPartitionOffset = $winPartition.Offset
         $diskPath = "\\.\PhysicalDrive$($diskInfo.DiskNumber)"
         
+        # Disable automount to prevent Windows from re-mounting volumes during raw copy
+        Write-Host "  Disabling volume automount..." -ForegroundColor DarkGray
+        $null = & mountvol /N 2>$null
+        
+        # Ensure disk is writable and volumes are not mounted
+        Write-Host "  Preparing disk for write operations..." -ForegroundColor DarkGray
+        $disk = Get-Disk -Number $diskInfo.DiskNumber
+        if ($disk.IsReadOnly) {
+            Write-Host "    Setting disk to read-write..." -ForegroundColor DarkGray
+            Set-Disk -Number $diskInfo.DiskNumber -IsReadOnly $false
+            Start-Sleep -Seconds 1
+        }
+        if ($disk.IsOffline) {
+            Write-Host "    Bringing disk online..." -ForegroundColor DarkGray
+            Set-Disk -Number $diskInfo.DiskNumber -IsOffline $false
+            Start-Sleep -Seconds 1
+        }
+        
+        # CRITICAL: Remove any auto-mounted volumes - this is essential for Azure VMs
+        # Windows may auto-mount partitions after creation, which locks the disk for raw writes
+        Write-Host "    Dismounting any auto-mounted volumes..." -ForegroundColor DarkGray
+        $partitions = Get-Partition -DiskNumber $diskInfo.DiskNumber -ErrorAction SilentlyContinue
+        foreach ($part in $partitions) {
+            # Remove any drive letters
+            if ($part.DriveLetter) {
+                Write-Host "      Removing drive letter $($part.DriveLetter): from partition $($part.PartitionNumber)..." -ForegroundColor DarkGray
+                try {
+                    Remove-PartitionAccessPath -DiskNumber $diskInfo.DiskNumber -PartitionNumber $part.PartitionNumber -AccessPath "$($part.DriveLetter):\" -ErrorAction Stop
+                }
+                catch {
+                    Write-Host "      Warning: Could not remove drive letter: $_" -ForegroundColor Yellow
+                }
+            }
+            # Also try to remove any access paths
+            $accessPaths = $part.AccessPaths | Where-Object { $_ -and $_ -ne "" }
+            foreach ($path in $accessPaths) {
+                if ($path -match '^[A-Z]:\\$') {
+                    try {
+                        Remove-PartitionAccessPath -DiskNumber $diskInfo.DiskNumber -PartitionNumber $part.PartitionNumber -AccessPath $path -ErrorAction SilentlyContinue
+                    }
+                    catch { }
+                }
+            }
+        }
+        
+        # Take disk offline and online to release any lingering locks
+        Write-Host "    Cycling disk offline/online to release locks..." -ForegroundColor DarkGray
+        try {
+            Set-Disk -Number $diskInfo.DiskNumber -IsOffline $true -ErrorAction Stop
+            Start-Sleep -Milliseconds 500
+            Set-Disk -Number $diskInfo.DiskNumber -IsOffline $false -ErrorAction Stop
+            Start-Sleep -Seconds 1
+        }
+        catch {
+            Write-Host "      Warning: Could not cycle disk: $_" -ForegroundColor Yellow
+        }
+        
+        # Refresh partition info after cycling
+        $winPartition = Get-Partition -DiskNumber $diskInfo.DiskNumber | Where-Object { $_.Size -eq ($partitions | Sort-Object Size -Descending | Select-Object -First 1).Size } | Select-Object -First 1
+        if (-not $winPartition) {
+            $winPartition = $diskInfo.WindowsPartition
+        }
+        $winPartitionOffset = $winPartition.Offset
+        
+        # Diagnostic info
+        $disk = Get-Disk -Number $diskInfo.DiskNumber
+        Write-Host "    Disk status: Online=$(-not $disk.IsOffline), ReadOnly=$($disk.IsReadOnly), OperationalStatus=$($disk.OperationalStatus)" -ForegroundColor DarkGray
+        
         Write-Host ""
         Write-Host "  Copying to partition at offset $winPartitionOffset..." -ForegroundColor Cyan
+        Write-Host "  Disk path: $diskPath" -ForegroundColor DarkGray
         Write-Host ""
         
         $blockSizeBytes = $BlockSizeMB * 1MB
@@ -1321,6 +1435,11 @@ function New-BootableVolumeClone {
         
         # Install boot files
         if (-not $SkipBootFix) {
+            # Re-enable automount for drive letter assignment
+            Write-Host "  Re-enabling volume automount..." -ForegroundColor DarkGray
+            $null = & mountvol /E 2>$null
+            Start-Sleep -Seconds 1
+            
             $windowsDriveLetter = Get-AvailableDriveLetter
             if (-not $windowsDriveLetter) { throw "No available drive letters" }
             
@@ -1337,9 +1456,9 @@ function New-BootableVolumeClone {
         }
         
         Write-Host ""
-        Write-Host "╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Green
-        Write-Host "║                    CLONE COMPLETED SUCCESSFULLY                   ║" -ForegroundColor Green
-        Write-Host "╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+        Write-Host "+===================================================================+" -ForegroundColor Green
+        Write-Host "|                    CLONE COMPLETED SUCCESSFULLY                   |" -ForegroundColor Green
+        Write-Host "+===================================================================+" -ForegroundColor Green
         Write-Host ""
         Write-Host "  VHDX File: $DestinationVHDX" -ForegroundColor White
         
@@ -1370,6 +1489,9 @@ function New-BootableVolumeClone {
         throw
     }
     finally {
+        # Re-enable automount
+        $null = & mountvol /E 2>$null
+        
         if ($vhdHandle -ne [IntPtr]::Zero) { Dismount-RawVHDX -Handle $vhdHandle }
         if ($snapshot) { Remove-VssSnapshot -ShadowId $snapshot.Id }
     }
@@ -1426,7 +1548,7 @@ function Start-InteractiveMode {
             Write-Host "  Destination: $destinationPath" -ForegroundColor White
             Write-Host ""
             Write-Host "  Options:" -ForegroundColor White
-            Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host "  -------------------------------------------------------------" -ForegroundColor DarkGray
             Write-Host ""
             Write-Host "    [1] Boot Mode:     $optBootMode" -ForegroundColor Yellow
             Write-Host "    [2] Copy Mode:     $(if ($optFullCopy) { 'Full (all sectors)' } else { 'Smart (allocated only)' })" -ForegroundColor Yellow
