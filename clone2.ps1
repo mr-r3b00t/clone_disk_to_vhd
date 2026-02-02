@@ -1,4 +1,4 @@
-\xEF\xBB\xBF#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 #Requires -Version 5.1
 
 <#
@@ -138,6 +138,99 @@ function Test-DestinationSpace {
     
     Write-Warning "Could not verify destination space"
     return $true
+}
+
+function Test-ControlledFolderAccess {
+    param(
+        [string]$DestinationPath
+    )
+    
+    try {
+        $mpPref = Get-MpPreference -ErrorAction Stop
+        
+        # Check if Controlled Folder Access is enabled (1 = Enabled, 2 = Audit)
+        if ($mpPref.EnableControlledFolderAccess -eq 0) {
+            return $true  # Not enabled, no problem
+        }
+        
+        # Default protected folders
+        $defaultProtected = @(
+            [Environment]::GetFolderPath('Desktop')
+            [Environment]::GetFolderPath('MyDocuments')
+            [Environment]::GetFolderPath('MyPictures')
+            [Environment]::GetFolderPath('MyVideos')
+            [Environment]::GetFolderPath('MyMusic')
+            [Environment]::GetFolderPath('Favorites')
+            "$env:USERPROFILE\OneDrive"
+            "$env:PUBLIC\Documents"
+            "$env:PUBLIC\Pictures"
+            "$env:PUBLIC\Videos"
+            "$env:PUBLIC\Music"
+            "$env:PUBLIC\Desktop"
+        )
+        
+        # Add custom protected folders if any
+        $customProtected = @()
+        if ($mpPref.ControlledFolderAccessProtectedFolders) {
+            $customProtected = @($mpPref.ControlledFolderAccessProtectedFolders)
+        }
+        
+        $allProtected = @($defaultProtected + $customProtected) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue) }
+        
+        # Normalize paths for comparison
+        $destFullPath = [System.IO.Path]::GetFullPath($DestinationPath)
+        $scriptPath = $PSScriptRoot
+        if (-not $scriptPath) { $scriptPath = Split-Path -Parent $MyInvocation.PSCommandPath -ErrorAction SilentlyContinue }
+        if (-not $scriptPath) { $scriptPath = (Get-Location).Path }
+        
+        $warnings = @()
+        
+        foreach ($protected in $allProtected) {
+            $protectedFull = [System.IO.Path]::GetFullPath($protected).TrimEnd('\')
+            
+            # Check destination
+            if ($destFullPath -like "$protectedFull\*" -or $destFullPath -eq $protectedFull) {
+                $warnings += "Destination path is inside protected folder: $protected"
+            }
+            
+            # Check script location
+            if ($scriptPath -and ($scriptPath -like "$protectedFull\*" -or $scriptPath -eq $protectedFull)) {
+                $warnings += "Script is running from protected folder: $protected"
+            }
+        }
+        
+        if ($warnings.Count -gt 0) {
+            Write-Host ""
+            Write-Host "+===================================================================+" -ForegroundColor Red
+            Write-Host "|              CONTROLLED FOLDER ACCESS WARNING                     |" -ForegroundColor Red
+            Write-Host "+===================================================================+" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  Windows Defender Controlled Folder Access is ENABLED and may" -ForegroundColor Yellow
+            Write-Host "  block this script from writing files." -ForegroundColor Yellow
+            Write-Host ""
+            foreach ($w in $warnings) {
+                Write-Host "  - $w" -ForegroundColor Yellow
+            }
+            Write-Host ""
+            Write-Host "  SOLUTIONS:" -ForegroundColor White
+            Write-Host "  1. Use a destination outside protected folders (e.g., C:\VMs\)" -ForegroundColor Gray
+            Write-Host "  2. Add PowerShell to allowed apps:" -ForegroundColor Gray
+            Write-Host "     Settings > Windows Security > Virus & threat protection >" -ForegroundColor DarkGray
+            Write-Host "     Ransomware protection > Allow an app through Controlled folder access" -ForegroundColor DarkGray
+            Write-Host "     Add: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "+===================================================================+" -ForegroundColor Red
+            Write-Host ""
+            
+            return $false
+        }
+        
+        return $true
+    }
+    catch {
+        # If we can't check (e.g., not running as admin or Windows Defender not available), continue
+        return $true
+    }
 }
 
 function Get-AvailableDriveLetter {
@@ -1115,7 +1208,8 @@ function Copy-VolumeToPartition {
             if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
                 $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
                 $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
-                throw "Write failed at offset $destOffset. Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg"
+                $cfaHint = if ($win32Err -eq 5) { " (Possible cause: Windows Defender Controlled Folder Access)" } else { "" }
+                throw "Write failed at offset $destOffset. Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg$cfaHint"
             }
             
             $totalCopied += $bytesRead
@@ -1183,7 +1277,8 @@ function Copy-AllocatedBlocksToPartition {
                 if (-not [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)) {
                     $win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
                     $errMsg = (New-Object System.ComponentModel.Win32Exception($win32Err)).Message
-                    throw "Write failed at offset $destByteOffset (cluster $clusterOffset). Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg"
+                    $cfaHint = if ($win32Err -eq 5) { " (Possible cause: Windows Defender Controlled Folder Access)" } else { "" }
+                    throw "Write failed at offset $destByteOffset (cluster $clusterOffset). Tried $bytesRead bytes, wrote $bytesWritten. Error $win32Err - $errMsg$cfaHint"
                 }
                 
                 $totalCopied += $bytesRead
@@ -1258,6 +1353,16 @@ function New-BootableVolumeClone {
         
         # Check destination space
         Test-DestinationSpace -DestPath $DestinationVHDX -RequiredBytes $requiredDiskSpace
+        
+        # Check for Controlled Folder Access issues
+        $cfaCheck = Test-ControlledFolderAccess -DestinationPath $DestinationVHDX
+        if (-not $cfaCheck) {
+            Write-Host "  Do you want to continue anyway? (y/N): " -ForegroundColor Yellow -NoNewline
+            $response = Read-Host
+            if ($response -notmatch '^[Yy]') {
+                throw "Aborted due to Controlled Folder Access restrictions"
+            }
+        }
         
         Write-Host ""
         Write-Host "+===================================================================+" -ForegroundColor Yellow
